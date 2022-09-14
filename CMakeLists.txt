@@ -841,15 +841,18 @@ if(EVENT__HAVE_EVENT_PORTS)
 endif()
 
 if (NOT EVENT__DISABLE_OPENSSL)
-    find_package(OpenSSL REQUIRED)
+    if (${CMAKE_VERSION} VERSION_GREATER "3.3")
+        find_package(OpenSSL REQUIRED COMPONENTS Crypto SSL)
+        list(APPEND LIB_APPS OpenSSL::SSL OpenSSL::Crypto)
+    else()
+        find_package(OpenSSL REQUIRED)
+        message(STATUS "OpenSSL include: ${OPENSSL_INCLUDE_DIR}")
+        message(STATUS "OpenSSL lib: ${OPENSSL_LIBRARIES}")
+        include_directories(${OPENSSL_INCLUDE_DIR})
+        list(APPEND LIB_APPS ${OPENSSL_LIBRARIES})
+    endif()
 
     set(EVENT__HAVE_OPENSSL 1)
-
-    message(STATUS "OpenSSL include: ${OPENSSL_INCLUDE_DIR}")
-    message(STATUS "OpenSSL lib: ${OPENSSL_LIBRARIES}")
-
-    include_directories(${OPENSSL_INCLUDE_DIR})
-
     list(APPEND SRC_OPENSSL bufferevent_openssl.c)
     list(APPEND HDR_PUBLIC include/event2/bufferevent_ssl.h)
     list(APPEND LIB_APPS ${OPENSSL_LIBRARIES})
@@ -953,11 +956,18 @@ add_event_library(event_extra
     SOURCES ${SRC_EXTRA})
 
 if (NOT EVENT__DISABLE_OPENSSL)
-    add_event_library(event_openssl
-        INNER_LIBRARIES event_core
-        OUTER_INCLUDES ${OPENSSL_INCLUDE_DIR}
-        LIBRARIES ${OPENSSL_LIBRARIES}
-        SOURCES ${SRC_OPENSSL})
+    if (TARGET OpenSSL::SSL AND TARGET OpenSSL::Crypto)
+        add_event_library(event_openssl
+            INNER_LIBRARIES event_core
+            LIBRARIES OpenSSL::SSL OpenSSL::Crypto
+            SOURCES ${SRC_OPENSSL})
+    else()
+        add_event_library(event_openssl
+            INNER_LIBRARIES event_core
+            OUTER_INCLUDES ${OPENSSL_INCLUDE_DIR}
+            LIBRARIES ${OPENSSL_LIBRARIES}
+            SOURCES ${SRC_OPENSSL})
+    endif()
 endif()
 
 if (EVENT__HAVE_PTHREADS)
