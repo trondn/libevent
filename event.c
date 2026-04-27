@@ -2948,9 +2948,6 @@ event_active_nolock_(struct event *ev, int res, short ncalls)
 		break;
 	}
 
-	if (ev->ev_pri < base->event_running_priority)
-		base->event_continue = 1;
-
 	if (ev->ev_events & EV_SIGNAL) {
 #ifndef EVENT__DISABLE_THREAD_SUPPORT
 		if (base->current_event == event_to_event_callback(ev) &&
@@ -3027,6 +3024,10 @@ event_callback_activate_nolock_(struct event_base *base,
 
 	event_queue_insert_active(base, evcb);
 
+	if (base->event_running_priority != -1 &&
+	    evcb->evcb_pri < base->event_running_priority)
+		base->event_continue = 1;
+
 	if (EVBASE_NEED_NOTIFY(base))
 		evthread_notify_base(base);
 
@@ -3041,6 +3042,11 @@ event_callback_activate_later_nolock_(struct event_base *base,
 		return 0;
 
 	event_queue_insert_active_later(base, evcb);
+
+	if (base->event_running_priority != -1 &&
+	    evcb->evcb_pri < base->event_running_priority)
+		base->event_continue = 1;
+
 	if (EVBASE_NEED_NOTIFY(base))
 		evthread_notify_base(base);
 	return 1;
