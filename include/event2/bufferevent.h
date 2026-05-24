@@ -170,7 +170,14 @@ enum bufferevent_options {
 	* bufferevent.  This option currently requires that
 	* BEV_OPT_DEFER_CALLBACKS also be set; a future version of Libevent
 	* might remove the requirement.*/
-	BEV_OPT_UNLOCK_CALLBACKS = (1<<3)
+	BEV_OPT_UNLOCK_CALLBACKS = (1<<3),
+
+	/** If set, capture kernel-measured receive timestamps for socket
+	 * bufferevents. Timestamps can be retrieved with
+	 * bufferevent_socket_get_recv_timestamp() or
+	 * bufferevent_socket_get_recv_timestamp_ns(). Only supported for
+	 * socket bufferevents created with bufferevent_socket_new(). */
+	BEV_OPT_RECV_TIMESTAMPS = (1<<4)
 };
 
 /**
@@ -1016,6 +1023,60 @@ EVENT2_EXPORT_SYMBOL
 void
 bufferevent_rate_limit_group_reset_totals(
 	struct bufferevent_rate_limit_group *grp);
+
+/**
+   @name Socket receive timestamp support
+
+   When a socket bufferevent is created with the BEV_OPT_RECV_TIMESTAMPS
+   option, the bufferevent captures kernel-measured receive timestamps
+   for incoming packets. These timestamps can be retrieved with the
+   following functions.
+
+   Timestamps are kernel-measured at packet arrival time, providing
+   higher accuracy than user-space timestamping. Precision varies by
+   platform: nanosecond precision on Linux (with SO_TIMESTAMPNS),
+   microsecond on macOS and FreeBSD.
+
+   @{
+ */
+
+/**
+   Get the kernel receive timestamp with microsecond precision.
+
+   When BEV_OPT_RECV_TIMESTAMPS is enabled on a socket bufferevent,
+   this function retrieves the kernel-measured receive time of the
+   most recent packet with microsecond precision.
+
+   @param bev the bufferevent
+   @param tv pointer to timeval struct to populate with the timestamp
+   @return 0 if timestamp available and populated, -1 if no timestamp
+           available or bufferevent is not a socket bufferevent
+ */
+EVENT2_EXPORT_SYMBOL
+int bufferevent_socket_get_recv_timestamp(struct bufferevent *bev,
+   struct timeval *tv);
+
+/**
+  Get the kernel receive timestamp with nanosecond precision.
+
+  When BEV_OPT_RECV_TIMESTAMPS is enabled on a socket bufferevent,
+  this function retrieves the kernel-measured receive time of the
+  most recent packet with nanosecond precision if available.
+
+  On platforms that support SO_TIMESTAMPNS (Linux 2.6.22+), this
+  returns nanosecond precision. On other platforms, microsecond
+  precision timestamps are converted to nanoseconds.
+
+  @param bev the bufferevent
+  @param ts pointer to timespec struct to populate with the timestamp
+  @return 0 if timestamp available and populated, -1 if no timestamp
+          available or bufferevent is not a socket bufferevent
+ */
+EVENT2_EXPORT_SYMBOL
+int bufferevent_socket_get_recv_timestamp_ns(struct bufferevent *bev,
+   struct timespec *ts);
+
+/*@}*/
 
 #ifdef __cplusplus
 }

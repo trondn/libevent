@@ -84,6 +84,40 @@ static int be_socket_ctrl(struct bufferevent *, enum bufferevent_ctrl_op, union 
 
 static void be_socket_setfd(struct bufferevent *, evutil_socket_t);
 
+/* ========================================================================
+ * Socket receive timestamp support (SO_TIMESTAMP)
+ * ======================================================================== */
+
+/**
+ * Enable SO_TIMESTAMP socket option for kernel receive timestamping
+ *
+ * Returns:
+ *   1 = SO_TIMESTAMPNS enabled (nanosecond precision)
+ *   0 = SO_TIMESTAMP enabled (microsecond precision)
+ *   -1 = timestamps not available on this platform
+ */
+static int
+be_socket_enable_timestamps_(evutil_socket_t fd)
+{
+	int on = 1;
+
+#if EVENT__HAVE_DECL_SO_TIMESTAMPNS
+	/* Try nanosecond precision first (Linux 2.6.22+) */
+	if (setsockopt(fd, SOL_SOCKET, SO_TIMESTAMPNS, &on, sizeof(on)) == 0) {
+		return 1;
+	}
+#endif
+
+#if EVENT__HAVE_DECL_SO_TIMESTAMP
+	/* Fall back to microsecond precision */
+	if (setsockopt(fd, SOL_SOCKET, SO_TIMESTAMP, &on, sizeof(on)) == 0) {
+		return 0;
+	}
+#endif
+
+	return -1;
+}
+
 const struct bufferevent_ops bufferevent_ops_socket = {
 	"socket",
 	evutil_offsetof(struct bufferevent_private, bev),
@@ -187,7 +221,16 @@ bufferevent_readcb(evutil_socket_t fd, short event, void *arg)
 		goto done;
 
 	evbuffer_unfreeze(input, 0);
-	res = evbuffer_read(input, fd, (int)howmuch); /* XXXX evbuffer_read would do better to take and return ev_ssize_t */
+
+	if (bufev_p->recv_timestamps_enabled) {
+		/* Use recvmsg() to capture timestamps */
+		res = evbuffer_read_with_timestamp(input, fd, (int)howmuch,
+				&bufev_p->last_recv_ts.timestamp, &bufev_p->last_recv_ts.valid);
+	} else {
+		/* Use standard read when timestamps not enabled */
+		res = evbuffer_read(input, fd, (int)howmuch);
+	}
+
 	evbuffer_freeze(input, 0);
 
 	if (res == -1) {
@@ -369,6 +412,13 @@ bufferevent_socket_new(struct event_base *base, evutil_socket_t fd,
 	    EV_WRITE|EV_PERSIST|EV_FINALIZE, bufferevent_writecb, bufev);
 
 	evbuffer_add_cb(bufev->output, bufferevent_socket_outbuf_cb, bufev);
+
+	/* Enable receive timestamps if requested */
+	if (options & BEV_OPT_RECV_TIMESTAMPS) {
+		if (be_socket_enable_timestamps_(fd) >= 0) {
+			bufev_p->recv_timestamps_enabled = 1;
+		}
+	}
 
 	evbuffer_freeze(bufev->input, 0);
 	evbuffer_freeze(bufev->output, 1);
@@ -704,4 +754,50 @@ be_socket_ctrl(struct bufferevent *bev, enum bufferevent_ctrl_op op,
 	default:
 		return -1;
 	}
+}
+
+/* ========================================================================
+ * Public API: Timestamp retrieval
+ * ======================================================================== */
+
+int
+bufferevent_socket_get_recv_timestamp(struct bufferevent *bev,
+    struct timeval *tv)
+{
+	struct bufferevent_private *bev_p = BEV_UPCAST(bev);
+
+	if (!tv || !BEV_IS_SOCKET(bev))
+		return -1;
+
+	BEV_LOCK(bev);
+	if (!bev_p->last_recv_ts.valid) {
+		BEV_UNLOCK(bev);
+		return -1;
+	}
+
+	/* Convert from timespec to timeval, dropping nanoseconds */
+	tv->tv_sec = bev_p->last_recv_ts.timestamp.tv_sec;
+	tv->tv_usec = bev_p->last_recv_ts.timestamp.tv_nsec / 1000;
+	BEV_UNLOCK(bev);
+	return 0;
+}
+
+int
+bufferevent_socket_get_recv_timestamp_ns(struct bufferevent *bev,
+    struct timespec *ts)
+{
+	struct bufferevent_private *bev_p = BEV_UPCAST(bev);
+
+	if (!ts || !BEV_IS_SOCKET(bev))
+		return -1;
+
+	BEV_LOCK(bev);
+	if (!bev_p->last_recv_ts.valid) {
+		BEV_UNLOCK(bev);
+		return -1;
+	}
+
+	*ts = bev_p->last_recv_ts.timestamp;
+	BEV_UNLOCK(bev);
+	return 0;
 }

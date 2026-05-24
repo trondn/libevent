@@ -2411,6 +2411,157 @@ done:
 	return result;
 }
 
+#if defined(_WIN32) || !defined(USE_IOVEC_IMPL)
+
+/* Windows stub: SO_TIMESTAMPING not supported on Windows */
+int evbuffer_read_with_timestamp(struct evbuffer *buf, evutil_socket_t fd,
+	int howmuch, struct timespec *timestamp, int* timestamp_found) {
+	if (timestamp) {
+		memset(timestamp, 0, sizeof(*timestamp));
+	}
+	if (timestamp_found) {
+		*timestamp_found = 0;
+	}
+	return evbuffer_read(buf, fd, howmuch);
+}
+
+#else
+
+int evbuffer_read_with_timestamp(struct evbuffer *buf, evutil_socket_t fd,
+	int howmuch, struct timespec *timestamp, int* timestamp_found) {
+	struct evbuffer_chain **chainp;
+	int n;
+	int result;
+	int nvecs;
+	int i;
+	int remaining;
+	IOV_TYPE vecs[NUM_READ_IOVEC];
+	struct msghdr msg;
+	/* Control message buffer for cmsg data */
+	unsigned char control[
+		CMSG_SPACE(sizeof(struct timespec)) +    /* SCM_TIMESTAMPNS */
+		CMSG_SPACE(sizeof(struct timeval)) + 64  /* SCM_TIMESTAMP + extra */
+	];
+
+	if (timestamp) {
+		memset(timestamp, 0, sizeof(*timestamp));
+	}
+	if (timestamp_found) {
+		*timestamp_found = 0;
+	}
+
+	EVBUFFER_LOCK(buf);
+
+	if (buf->freeze_end) {
+		result = -1;
+		goto done;
+	}
+
+	if (howmuch < 0 || howmuch > EVBUFFER_MAX_READ) {
+		howmuch = EVBUFFER_MAX_READ;
+	}
+
+	/* Since we can use iovecs, we're willing to use the last
+	 * NUM_READ_IOVEC chains. */
+	if (evbuffer_expand_fast_(buf, howmuch, NUM_READ_IOVEC) == -1) {
+		result = -1;
+		goto done;
+	}
+
+	nvecs = evbuffer_read_setup_vecs_(
+		buf, howmuch, vecs, NUM_READ_IOVEC, &chainp, 1);
+
+	/* Setup message header */
+	memset(&msg, 0, sizeof(msg));
+	msg.msg_iov = vecs;
+	msg.msg_iovlen = nvecs;
+	msg.msg_control = control;
+	msg.msg_controllen = sizeof(control);
+
+	/* Receive with ancillary data */
+	n = recvmsg(fd, &msg, 0);
+
+	if (n == -1) {
+		result = -1;
+		goto done;
+	}
+	if (n == 0) {
+		result = 0;
+		goto done;
+	}
+
+	/* Check if control data was truncated */
+	if (timestamp && (msg.msg_flags & MSG_CTRUNC)) {
+		if (timestamp_found) {
+			*timestamp_found = 0;
+		}
+	} else if (timestamp) {
+		struct cmsghdr *cmsg;
+		for (cmsg = CMSG_FIRSTHDR(&msg); cmsg; cmsg = CMSG_NXTHDR(&msg, cmsg)) {
+			if (cmsg->cmsg_level != SOL_SOCKET)
+				continue;
+#if EVENT__HAVE_DECL_SO_TIMESTAMPNS
+			if (cmsg->cmsg_type == SCM_TIMESTAMPNS) {
+				if (cmsg->cmsg_len < CMSG_LEN(sizeof(struct timespec)))
+					continue;
+				*timestamp = *(struct timespec *)CMSG_DATA(cmsg);
+				if (timestamp_found) {
+					*timestamp_found = 1;
+				}
+				break;
+			}
+#endif
+
+#if EVENT__HAVE_DECL_SO_TIMESTAMP
+			if (cmsg->cmsg_type == SCM_TIMESTAMP) {
+				struct timeval *tv;
+				if (cmsg->cmsg_len < CMSG_LEN(sizeof(struct timeval)))
+					continue;
+				tv = (struct timeval *)CMSG_DATA(cmsg);
+				timestamp->tv_sec = tv->tv_sec;
+				timestamp->tv_nsec = tv->tv_usec * 1000L;
+				if (timestamp_found) {
+					*timestamp_found = 1;
+				}
+				break;
+			}
+#endif
+		}
+	}
+
+	remaining = n;
+	for (i=0; i < nvecs; ++i) {
+		/* can't overflow, since only mutable chains have
+		 * huge misaligns. */
+		size_t space = (size_t) CHAIN_SPACE_LEN(*chainp);
+		/* XXXX This is a kludge that can waste space in perverse
+		 * situations. */
+		if (space > EVBUFFER_CHAIN_MAX)
+			space = EVBUFFER_CHAIN_MAX;
+		if ((ev_ssize_t)space < remaining) {
+			(*chainp)->off += space;
+			remaining -= (int)space;
+		} else {
+			(*chainp)->off += remaining;
+			buf->last_with_datap = chainp;
+			break;
+		}
+		chainp = &(*chainp)->next;
+	}
+
+	buf->total_len += n;
+	buf->n_add_for_cb += n;
+
+	/* Tell someone about changes in this buffer */
+	evbuffer_invoke_callbacks_(buf);
+	result = n;
+done:
+	EVBUFFER_UNLOCK(buf);
+	return result;
+}
+
+#endif
+
 #ifdef USE_IOVEC_IMPL
 static inline int
 evbuffer_write_iovec(struct evbuffer *buffer, evutil_socket_t fd,

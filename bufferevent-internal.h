@@ -230,6 +230,15 @@ struct bufferevent_private {
 	} conn_address;
 
 	struct evdns_getaddrinfo_request *dns_request;
+
+	/** Receive timestamp support (when BEV_OPT_RECV_TIMESTAMPS is set) */
+	struct {
+		struct timespec timestamp;
+		int valid;
+	} last_recv_ts;
+
+	/** Flag: set if receive timestamps are enabled */
+	unsigned recv_timestamps_enabled : 1;
 };
 
 /** Possible operations for a control callback. */

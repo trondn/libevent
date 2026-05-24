@@ -735,6 +735,21 @@ EVENT2_EXPORT_SYMBOL
 int evbuffer_read(struct evbuffer *buffer, evutil_socket_t fd, int howmuch);
 
 /**
+  Read from a file descriptor and store the result in an evbuffer.
+
+  @param buffer the evbuffer to store the result
+  @param fd the file descriptor to read from
+  @param howmuch the number of bytes to be read
+  @param timestamp where to store the timestamp
+  @param timestamp_found set to 1 if timestamp is updated
+  @return the number of bytes read, or -1 if an error occurred
+  @see evbuffer_write()
+ */
+EVENT2_EXPORT_SYMBOL
+int evbuffer_read_with_timestamp(struct evbuffer *buffer, evutil_socket_t fd,
+    int howmuch, struct timespec *timestamp, int* timestamp_found);
+
+/**
    Search for a string within an evbuffer.
 
    @param buffer the evbuffer to be searched
