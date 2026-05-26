@@ -224,8 +224,7 @@ bufferevent_readcb(evutil_socket_t fd, short event, void *arg)
 
 	if (bufev_p->recv_timestamps_enabled) {
 		/* Use recvmsg() to capture timestamps */
-		res = evbuffer_read_with_timestamp(input, fd, (int)howmuch,
-				&bufev_p->last_recv_ts.timestamp, &bufev_p->last_recv_ts.valid);
+		res = evbuffer_read_with_timestamp(input, fd, (int)howmuch);
 	} else {
 		/* Use standard read when timestamps not enabled */
 		res = evbuffer_read(input, fd, (int)howmuch);
@@ -764,21 +763,13 @@ int
 bufferevent_socket_get_recv_timestamp(struct bufferevent *bev,
     struct timeval *tv)
 {
-	struct bufferevent_private *bev_p = BEV_UPCAST(bev);
-
-	if (!tv || !BEV_IS_SOCKET(bev))
+	struct timespec ts;
+	if (bufferevent_socket_get_recv_timestamp_ns(bev, &ts) < 0)
 		return -1;
-
-	BEV_LOCK(bev);
-	if (!bev_p->last_recv_ts.valid) {
-		BEV_UNLOCK(bev);
-		return -1;
-	}
 
 	/* Convert from timespec to timeval, dropping nanoseconds */
-	tv->tv_sec = bev_p->last_recv_ts.timestamp.tv_sec;
-	tv->tv_usec = bev_p->last_recv_ts.timestamp.tv_nsec / 1000;
-	BEV_UNLOCK(bev);
+	tv->tv_sec = ts.tv_sec;
+	tv->tv_usec = ts.tv_nsec / 1000;
 	return 0;
 }
 
@@ -786,18 +777,17 @@ int
 bufferevent_socket_get_recv_timestamp_ns(struct bufferevent *bev,
     struct timespec *ts)
 {
-	struct bufferevent_private *bev_p = BEV_UPCAST(bev);
+	struct evbuffer * input;
+	int ret;
 
 	if (!ts || !BEV_IS_SOCKET(bev))
 		return -1;
 
 	BEV_LOCK(bev);
-	if (!bev_p->last_recv_ts.valid) {
-		BEV_UNLOCK(bev);
-		return -1;
-	}
 
-	*ts = bev_p->last_recv_ts.timestamp;
+	input = bufferevent_get_input(bev);
+	ret = evbuffer_get_timestamp(input, ts);
+
 	BEV_UNLOCK(bev);
-	return 0;
+	return ret;
 }

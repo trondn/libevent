@@ -1386,6 +1386,11 @@ evbuffer_pullup(struct evbuffer *buf, ev_ssize_t size)
 	}
 
 	if (CHAIN_PINNED(chain)) {
+		/* Pinned chain case: expand in-place by appending data from
+		 * subsequent chains. Timestamps from subsequent chains being
+		 * consolidated are intentionally discarded; only this chain's
+		 * timestamp is preserved as it contains the oldest data.
+		 */
 		size_t old_off = chain->off;
 		if (CHAIN_SPACE_LEN(chain) < size - chain->off) {
 			/* not enough room at end of chunk. */
@@ -1397,6 +1402,11 @@ evbuffer_pullup(struct evbuffer *buf, ev_ssize_t size)
 		size -= old_off;
 		chain = chain->next;
 	} else if (chain->buffer_len - chain->misalign >= (size_t)size) {
+		/* Sufficient space case: expand in-place without reallocation
+		 * by appending data from subsequent chains. Timestamps from
+		 * subsequent chains being consolidated are intentionally discarded;
+		 * only this chain's timestamp is preserved.
+		 */
 		/* already have enough space in the first chain */
 		size_t old_off = chain->off;
 		buffer = chain->buffer + chain->misalign + chain->off;
@@ -1411,11 +1421,21 @@ evbuffer_pullup(struct evbuffer *buf, ev_ssize_t size)
 		}
 		buffer = tmp->buffer;
 		tmp->off = size;
+		/* Preserve timestamp from the original first chain */
+		if (chain->timestamp.valid) {
+			tmp->timestamp = chain->timestamp;
+		}
 		buf->first = tmp;
 	}
 
 	/* TODO(niels): deal with buffers that point to NULL like sendfile */
 
+	/* Note: When consolidating multiple chains into one during pullup,
+	 * only the timestamp from the first (oldest) chain is preserved.
+	 * Timestamps from subsequent chains are intentionally discarded.
+	 * This design choice keeps the API simple by tracking only the
+	 * receipt time of the oldest data in the buffer.
+	 */
 	/* Copy and free every chunk that will be entirely pulled into tmp */
 	last_with_data = *buf->last_with_datap;
 	for (; chain != NULL && (size_t)size >= chain->off; chain = next) {
@@ -2414,21 +2434,19 @@ done:
 #if defined(_WIN32) || !defined(USE_IOVEC_IMPL)
 
 /* Windows stub: SO_TIMESTAMPING not supported on Windows */
-int evbuffer_read_with_timestamp(struct evbuffer *buf, evutil_socket_t fd,
-	int howmuch, struct timespec *timestamp, int* timestamp_found) {
-	if (timestamp) {
-		memset(timestamp, 0, sizeof(*timestamp));
-	}
-	if (timestamp_found) {
-		*timestamp_found = 0;
-	}
+int
+evbuffer_read_with_timestamp(
+	struct evbuffer *buf, evutil_socket_t fd, int howmuch)
+{
 	return evbuffer_read(buf, fd, howmuch);
 }
 
 #else
 
-int evbuffer_read_with_timestamp(struct evbuffer *buf, evutil_socket_t fd,
-	int howmuch, struct timespec *timestamp, int* timestamp_found) {
+int
+evbuffer_read_with_timestamp(
+	struct evbuffer *buf, evutil_socket_t fd, int howmuch)
+{
 	struct evbuffer_chain **chainp;
 	int n;
 	int result;
@@ -2443,12 +2461,9 @@ int evbuffer_read_with_timestamp(struct evbuffer *buf, evutil_socket_t fd,
 		CMSG_SPACE(sizeof(struct timeval)) + 64  /* SCM_TIMESTAMP + extra */
 	];
 
-	if (timestamp) {
-		memset(timestamp, 0, sizeof(*timestamp));
-	}
-	if (timestamp_found) {
-		*timestamp_found = 0;
-	}
+	struct timespec ts;
+	int ts_found = 0;
+	memset(&ts, 0, sizeof(ts));
 
 	EVBUFFER_LOCK(buf);
 
@@ -2491,11 +2506,7 @@ int evbuffer_read_with_timestamp(struct evbuffer *buf, evutil_socket_t fd,
 	}
 
 	/* Check if control data was truncated */
-	if (timestamp && (msg.msg_flags & MSG_CTRUNC)) {
-		if (timestamp_found) {
-			*timestamp_found = 0;
-		}
-	} else if (timestamp) {
+	if (!(msg.msg_flags & MSG_CTRUNC)) {
 		struct cmsghdr *cmsg;
 		for (cmsg = CMSG_FIRSTHDR(&msg); cmsg; cmsg = CMSG_NXTHDR(&msg, cmsg)) {
 			if (cmsg->cmsg_level != SOL_SOCKET)
@@ -2504,10 +2515,8 @@ int evbuffer_read_with_timestamp(struct evbuffer *buf, evutil_socket_t fd,
 			if (cmsg->cmsg_type == SCM_TIMESTAMPNS) {
 				if (cmsg->cmsg_len < CMSG_LEN(sizeof(struct timespec)))
 					continue;
-				*timestamp = *(struct timespec *)CMSG_DATA(cmsg);
-				if (timestamp_found) {
-					*timestamp_found = 1;
-				}
+				ts = *(struct timespec *)CMSG_DATA(cmsg);
+				ts_found = 1;
 				break;
 			}
 #endif
@@ -2518,11 +2527,9 @@ int evbuffer_read_with_timestamp(struct evbuffer *buf, evutil_socket_t fd,
 				if (cmsg->cmsg_len < CMSG_LEN(sizeof(struct timeval)))
 					continue;
 				tv = (struct timeval *)CMSG_DATA(cmsg);
-				timestamp->tv_sec = tv->tv_sec;
-				timestamp->tv_nsec = tv->tv_usec * 1000L;
-				if (timestamp_found) {
-					*timestamp_found = 1;
-				}
+				ts.tv_sec = tv->tv_sec;
+				ts.tv_nsec = tv->tv_usec * 1000L;
+				ts_found = 1;
 				break;
 			}
 #endif
@@ -2541,8 +2548,16 @@ int evbuffer_read_with_timestamp(struct evbuffer *buf, evutil_socket_t fd,
 		if ((ev_ssize_t)space < remaining) {
 			(*chainp)->off += space;
 			remaining -= (int)space;
+			if (ts_found && (*chainp)->timestamp.valid == 0) {
+				(*chainp)->timestamp.ts = ts;
+				(*chainp)->timestamp.valid = 1;
+			}
 		} else {
 			(*chainp)->off += remaining;
+			if (ts_found && (*chainp)->timestamp.valid == 0) {
+				(*chainp)->timestamp.ts = ts;
+				(*chainp)->timestamp.valid = 1;
+			}
 			buf->last_with_datap = chainp;
 			break;
 		}
@@ -2561,6 +2576,24 @@ done:
 }
 
 #endif
+
+int evbuffer_get_timestamp(
+	struct evbuffer *buf, struct timespec *timestamp)
+{
+	int result = -1;
+	if (!timestamp) {
+		return -1;
+	}
+	EVBUFFER_LOCK(buf);
+	{
+		if (buf->first  && buf->first->timestamp.valid) {
+			*timestamp = buf->first->timestamp.ts;
+			result = 0;
+		}
+	}
+	EVBUFFER_UNLOCK(buf);
+	return result;
+}
 
 #ifdef USE_IOVEC_IMPL
 static inline int

@@ -740,14 +740,35 @@ int evbuffer_read(struct evbuffer *buffer, evutil_socket_t fd, int howmuch);
   @param buffer the evbuffer to store the result
   @param fd the file descriptor to read from
   @param howmuch the number of bytes to be read
-  @param timestamp where to store the timestamp
-  @param timestamp_found set to 1 if timestamp is updated
   @return the number of bytes read, or -1 if an error occurred
   @see evbuffer_write()
  */
 EVENT2_EXPORT_SYMBOL
 int evbuffer_read_with_timestamp(struct evbuffer *buffer, evutil_socket_t fd,
-    int howmuch, struct timespec *timestamp, int* timestamp_found);
+    int howmuch);
+
+/**
+ * Get the timestamp stored for the oldest recent data in the buffer chain. This
+ * is the timestamp of the oldest data in the buffer, or the timestamp of the
+ * most recent data if the buffer is empty.
+ *
+ * Returns the timestamp of when the oldest bytes currently in the buffer
+ * were received from the kernel. This is the timestamp of the first chain
+ * in the buffer.
+ *
+ * Note: When evbuffer_pullup() consolidates multiple chains, only the
+ * timestamp from the first (oldest) chain is preserved. This ensures that
+ * the timestamp always reflects when the oldest data in the buffer was
+ * received, regardless of how many internal consolidation operations
+ * have occurred.
+ *
+ * @param buffer The buffer to read from
+ * @param timestamp where to store the result
+ * @return 0 success
+ *         -1 failure (or no timestamp available)
+ */
+EVENT2_EXPORT_SYMBOL
+int evbuffer_get_timestamp(struct evbuffer *buffer, struct timespec *timestamp);
 
 /**
    Search for a string within an evbuffer.
