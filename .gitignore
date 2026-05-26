@@ -6,6 +6,9 @@
 *~
 *.swp
 
+# CLion
+/.idea/
+
 # C stuff
 *.o
 
