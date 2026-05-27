@@ -515,6 +515,10 @@ conn_closed(struct bufferevent_openssl *bev_ssl, int when, int errcode, int ret)
 		break;
 	case SSL_ERROR_SSL:
 		/* Protocol error. */
+#ifdef SSL_R_UNEXPECTED_EOF_WHILE_READING
+		if (ERR_GET_REASON(ERR_peek_error()) == SSL_R_UNEXPECTED_EOF_WHILE_READING)
+			dirty_shutdown = 1;
+#endif
 		put_error(bev_ssl, errcode);
 		break;
 	case SSL_ERROR_WANT_X509_LOOKUP:

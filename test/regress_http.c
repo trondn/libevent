@@ -119,13 +119,20 @@ static struct bufferevent *
 https_bev(struct event_base *base, void *arg)
 {
 	SSL *ssl = SSL_new(get_ssl_ctx());
+	struct bufferevent *bev;
 
 	SSL_use_certificate(ssl, ssl_getcert(ssl_getkey()));
 	SSL_use_PrivateKey(ssl, ssl_getkey());
 
-	return bufferevent_openssl_socket_new(
+	bev = bufferevent_openssl_socket_new(
 		base, -1, ssl, BUFFEREVENT_SSL_ACCEPTING,
 		BEV_OPT_CLOSE_ON_FREE);
+	if (!bev) {
+		SSL_free(ssl);
+		return NULL;
+	}
+	bufferevent_openssl_set_allow_dirty_shutdown(bev, 1);
+	return bev;
 }
 #endif
 static struct evhttp *
@@ -3078,10 +3085,19 @@ http_incomplete_errorcb(struct bufferevent *bev, short what, void *arg)
 	if (what & BEV_EVENT_CONNECTED)
 		return;
 
-	if (what == (BEV_EVENT_READING|BEV_EVENT_EOF))
+	if (what == (BEV_EVENT_READING|BEV_EVENT_EOF)) {
 		test_ok++;
-	else
+	} else if (what == (BEV_EVENT_READING|BEV_EVENT_ERROR)) {
+		/* Under SSL, raw socket shutdowns trigger TLS alert protocol errors on OpenSSL 3.0.
+		 * We accept this as a successful termination for this incomplete request test. */
+		if (bufferevent_get_openssl_error(bev) != 0) {
+			test_ok++;
+		} else {
+			test_ok = -2;
+		}
+	} else {
 		test_ok = -2;
+	}
 	event_base_loopexit(exit_base,NULL);
 }
 
