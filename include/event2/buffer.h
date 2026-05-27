@@ -325,6 +325,23 @@ int evbuffer_commit_space(struct evbuffer *buf,
     struct evbuffer_iovec *vec, int n_vecs);
 
 /**
+   Commits the space reserved by evbuffer_reserve_space() and associates a timespec with the committed chains.
+
+   @param buf the evbuffer in which to reserve space.
+   @param vec one or two extents returned by evbuffer_reserve_space.
+   @param n_vecs the number of extents.
+   @param ts pointer to timespec.
+   @param ts_valid non-zero if the timespec is valid.
+   @return 0 on success, -1 on error
+   @see evbuffer_reserve_space()
+*/
+EVENT2_EXPORT_SYMBOL
+int evbuffer_commit_space_with_timespec(struct evbuffer *buf,
+    struct evbuffer_iovec *vec, int n_vecs,
+    const struct timespec *ts, int ts_valid);
+
+
+/**
   Append data to the end of an evbuffer.
 
   @param buf the evbuffer to be appended to

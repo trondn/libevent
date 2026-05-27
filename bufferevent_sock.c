@@ -96,7 +96,7 @@ static void be_socket_setfd(struct bufferevent *, evutil_socket_t);
  *   0 = SO_TIMESTAMP enabled (microsecond precision)
  *   -1 = timestamps not available on this platform
  */
-static int
+int
 be_socket_enable_timestamps_(evutil_socket_t fd)
 {
 	int on = 1;
@@ -780,7 +780,7 @@ bufferevent_socket_get_recv_timestamp_ns(struct bufferevent *bev,
 	struct evbuffer * input;
 	int ret;
 
-	if (!ts || !BEV_IS_SOCKET(bev))
+	if (!ts || (!BEV_IS_SOCKET(bev) && strcmp(bev->be_ops->type, "ssl") != 0))
 		return -1;
 
 	BEV_LOCK(bev);

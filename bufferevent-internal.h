@@ -455,6 +455,9 @@ EVENT2_EXPORT_SYMBOL
 void
 bufferevent_socket_set_conn_address_(struct bufferevent *bev, struct sockaddr *addr, size_t addrlen);
 
+EVENT2_EXPORT_SYMBOL
+int be_socket_enable_timestamps_(evutil_socket_t fd);
+
 
 /** Internal use: We have just successfully read data into an inbuf, so
  * reset the read timeout (if any). */
