@@ -170,7 +170,19 @@ enum bufferevent_options {
 	* bufferevent.  This option currently requires that
 	* BEV_OPT_DEFER_CALLBACKS also be set; a future version of Libevent
 	* might remove the requirement.*/
-	BEV_OPT_UNLOCK_CALLBACKS = (1<<3)
+	BEV_OPT_UNLOCK_CALLBACKS = (1<<3),
+
+	/** If set, capture kernel-measured receive timestamps for socket
+	 * bufferevents. Timestamps can be retrieved from the input buffer
+	 * using evbuffer_get_timestamp(). Supported for socket bufferevents
+	 * created with bufferevent_socket_new() and OpenSSL socket bufferevents
+	 * created with bufferevent_openssl_socket_new().
+	 *
+	 * Note: enabling this option bypasses rate limiting on reads. On Linux,
+	 * the full message is fetched from the kernel (via MSG_PEEK|MSG_TRUNC)
+	 * to determine the exact datagram size before reading, which may exceed
+	 * any configured read limit. */
+	BEV_OPT_RECV_TIMESTAMPS = (1<<4)
 };
 
 /**

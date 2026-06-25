@@ -84,6 +84,40 @@ static int be_socket_ctrl(struct bufferevent *, enum bufferevent_ctrl_op, union 
 
 static void be_socket_setfd(struct bufferevent *, evutil_socket_t);
 
+/* ========================================================================
+ * Socket receive timestamp support (SO_TIMESTAMP)
+ * ======================================================================== */
+
+/**
+ * Enable SO_TIMESTAMP socket option for kernel receive timestamping
+ *
+ * Returns:
+ *   1 = SO_TIMESTAMPNS enabled (nanosecond precision)
+ *   0 = SO_TIMESTAMP enabled (microsecond precision)
+ *   -1 = timestamps not available on this platform
+ */
+int
+be_socket_enable_timestamps_(evutil_socket_t fd)
+{
+	int on = 1;
+
+#if EVENT__HAVE_DECL_SO_TIMESTAMPNS
+	/* Try nanosecond precision first (Linux 2.6.22+) */
+	if (setsockopt(fd, SOL_SOCKET, SO_TIMESTAMPNS, &on, sizeof(on)) == 0) {
+		return 1;
+	}
+#endif
+
+#if EVENT__HAVE_DECL_SO_TIMESTAMP
+	/* Fall back to microsecond precision */
+	if (setsockopt(fd, SOL_SOCKET, SO_TIMESTAMP, &on, sizeof(on)) == 0) {
+		return 0;
+	}
+#endif
+
+	return -1;
+}
+
 const struct bufferevent_ops bufferevent_ops_socket = {
 	"socket",
 	evutil_offsetof(struct bufferevent_private, bev),
@@ -187,7 +221,15 @@ bufferevent_readcb(evutil_socket_t fd, short event, void *arg)
 		goto done;
 
 	evbuffer_unfreeze(input, 0);
-	res = evbuffer_read(input, fd, (int)howmuch); /* XXXX evbuffer_read would do better to take and return ev_ssize_t */
+
+	if (bufev_p->recv_timestamps_enabled) {
+		/* Use recvmsg() to capture timestamps */
+		res = evbuffer_read_with_timestamp(input, fd, (int)howmuch);
+	} else {
+		/* Use standard read when timestamps not enabled */
+		res = evbuffer_read(input, fd, (int)howmuch);
+	}
+
 	evbuffer_freeze(input, 0);
 
 	if (res == -1) {
@@ -369,6 +411,13 @@ bufferevent_socket_new(struct event_base *base, evutil_socket_t fd,
 	    EV_WRITE|EV_PERSIST|EV_FINALIZE, bufferevent_writecb, bufev);
 
 	evbuffer_add_cb(bufev->output, bufferevent_socket_outbuf_cb, bufev);
+
+	/* Enable receive timestamps if requested */
+	if ((options & BEV_OPT_RECV_TIMESTAMPS) && fd >= 0) {
+		if (be_socket_enable_timestamps_(fd) >= 0) {
+			bufev_p->recv_timestamps_enabled = 1;
+		}
+	}
 
 	evbuffer_freeze(bufev->input, 0);
 	evbuffer_freeze(bufev->output, 1);
@@ -634,8 +683,16 @@ be_socket_setfd(struct bufferevent *bufev, evutil_socket_t fd)
 	event_assign(&bufev->ev_write, bufev->ev_base, fd,
 	    EV_WRITE|EV_PERSIST|EV_FINALIZE, bufferevent_writecb, bufev);
 
-	if (fd >= 0)
+	if (fd >= 0) {
 		bufferevent_enable(bufev, bufev->enabled);
+
+		/* Enable receive timestamps if requested */
+		if ((bufev_p->options & BEV_OPT_RECV_TIMESTAMPS) && !bufev_p->recv_timestamps_enabled) {
+			if (be_socket_enable_timestamps_(fd) >= 0) {
+				bufev_p->recv_timestamps_enabled = 1;
+			}
+		}
+	}
 
 	evutil_getaddrinfo_cancel_async_(bufev_p->dns_request);
 

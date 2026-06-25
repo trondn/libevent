@@ -204,6 +204,15 @@ struct evbuffer_chain {
 	/** number of references to this chain */
 	int refcnt;
 
+
+	/** Timestamp support. */
+	struct {
+		/* The timespec for the oldest data in this chunk */
+		struct timespec ts;
+		/* valid is set to a non-zero value when ts is set */
+		int valid;
+	} timestamp;
+
 	/** Usually points to the read-write memory belonging to this
 	 * buffer allocated as part of the evbuffer_chain allocation.
 	 * For mmap, this can be a read-only buffer and

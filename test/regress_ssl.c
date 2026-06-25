@@ -983,6 +983,244 @@ end:
 	bufferevent_free(server.bev);
 }
 
+static void
+bufferevent_openssl_recv_timestamps_readcb(struct bufferevent *bev, void *ctx)
+{
+	int *done = ctx;
+	struct timespec ts;
+	struct evbuffer *input;
+	char tmp[32];
+	int r;
+	int ts_result;
+
+	/* Fetch and verify timestamps BEFORE draining the buffer! */
+	input = bufferevent_get_input(bev);
+	ts_result = evbuffer_get_timestamp(input, &ts);
+
+	/* UNIX domain sockets don't support kernel timestamps on most
+	 * platforms, so timestamp may not be available. Just verify we can
+	 * read the data successfully. If kernel timestamp is available, the
+	 * caller would have set ts_result == 0. */
+	if (ts_result == 0) {
+		tt_assert(ts.tv_sec > 0);
+	}
+
+	r = bufferevent_read(bev, tmp, sizeof(tmp));
+	tt_int_op(r, ==, 14);
+	tt_mem_op(tmp, ==, "timestamp_test", 14);
+
+	*done = 1;
+	event_base_loopexit(bufferevent_get_base(bev), NULL);
+
+ end:
+	;
+}
+
+static void
+test_eventcb(struct bufferevent *bev, short what, void *ctx)
+{
+	TT_BLATHER(("test_eventcb: %p got event %d", bev, (int)what));
+	if (what & BEV_EVENT_ERROR) {
+		unsigned long err;
+		while ((err = ERR_get_error())) {
+			TT_BLATHER(("  SSL error: %s", ERR_error_string(err, NULL)));
+		}
+	}
+}
+
+static void
+test_bufferevent_openssl_direct_recv_timestamps(void *arg)
+{
+	struct basic_test_data *data = arg;
+	struct bufferevent *bev1 = NULL;
+	struct bufferevent *bev2 = NULL;
+	SSL *ssl1 = NULL, *ssl2 = NULL;
+	struct timespec ts;
+	int done = 0;
+	evutil_socket_t fd_pair[2] = { -1, -1 };
+
+	/* Create a socketpair */
+ #ifdef _WIN32
+	tt_assert(evutil_socketpair(AF_INET, SOCK_STREAM, 0, fd_pair) == 0);
+ #else
+	tt_assert(evutil_socketpair(AF_UNIX, SOCK_STREAM, 0, fd_pair) == 0);
+ #endif
+	tt_assert(evutil_make_socket_nonblocking(fd_pair[0]) == 0);
+	tt_assert(evutil_make_socket_nonblocking(fd_pair[1]) == 0);
+
+	ssl1 = SSL_new(get_ssl_ctx());
+	ssl2 = SSL_new(get_ssl_ctx());
+	tt_assert(ssl1);
+	tt_assert(ssl2);
+
+	SSL_use_certificate(ssl2, the_cert);
+	SSL_use_PrivateKey(ssl2, the_key);
+
+	/* Create direct socket openssl bufferevents.
+	 * bev2 has BEV_OPT_RECV_TIMESTAMPS enabled. */
+	bev1 = bufferevent_openssl_socket_new(
+		data->base, fd_pair[0], ssl1, BUFFEREVENT_SSL_CONNECTING,
+		BEV_OPT_CLOSE_ON_FREE | BEV_OPT_DEFER_CALLBACKS);
+	tt_assert(bev1);
+	fd_pair[0] = -1;
+
+	bev2 = bufferevent_openssl_socket_new(
+		data->base, fd_pair[1], ssl2, BUFFEREVENT_SSL_ACCEPTING,
+		BEV_OPT_CLOSE_ON_FREE | BEV_OPT_DEFER_CALLBACKS | BEV_OPT_RECV_TIMESTAMPS);
+	tt_assert(bev2);
+	fd_pair[1] = -1;
+
+	/* Verify initially no timestamps are present */
+	tt_int_op(evbuffer_get_timestamp(bufferevent_get_input(bev2), &ts), ==, -1);
+
+	/* Configure callbacks */
+	bufferevent_setcb(bev1, NULL, NULL, test_eventcb, NULL);
+	bufferevent_setcb(bev2, bufferevent_openssl_recv_timestamps_readcb, NULL, test_eventcb, &done);
+	tt_int_op(bufferevent_enable(bev1, EV_READ|EV_WRITE), ==, 0);
+	tt_int_op(bufferevent_enable(bev2, EV_READ|EV_WRITE), ==, 0);
+
+	/* Write data from bev1 */
+	tt_int_op(bufferevent_write(bev1, "timestamp_test", 14), ==, 0);
+
+	/* Dispatch base */
+	event_base_dispatch(data->base);
+
+	tt_int_op(done, ==, 1);
+
+ end:
+	if (bev1) {
+		bufferevent_free(bev1);
+	}
+	if (bev2) {
+		bufferevent_free(bev2);
+	}
+	if (fd_pair[0] >= 0) {
+		evutil_closesocket(fd_pair[0]);
+	}
+	if (fd_pair[1] >= 0) {
+		evutil_closesocket(fd_pair[1]);
+	}
+}
+
+static void
+bufferevent_openssl_filter_recv_timestamps_readcb(struct bufferevent *bev, void *ctx)
+{
+	int *done = ctx;
+	struct timespec ts;
+	struct evbuffer *input;
+	char tmp[32];
+	int r;
+	int ts_result;
+
+	input = bufferevent_get_input(bev);
+	ts_result = evbuffer_get_timestamp(input, &ts);
+
+	/* UNIX domain sockets don't support kernel timestamps on most
+	 * platforms, so timestamp may not be available. Just verify we can
+	 * read the data successfully. If kernel timestamp is available, the
+	 * caller would have set ts_result == 0. */
+	if (ts_result == 0) {
+		tt_assert(ts.tv_sec > 0);
+	}
+
+	r = bufferevent_read(bev, tmp, sizeof(tmp));
+	tt_int_op(r, ==, 9);
+	tt_mem_op(tmp, ==, "test_data", 9);
+
+	*done = 1;
+	event_base_loopexit(bufferevent_get_base(bev), NULL);
+
+ end:
+	;
+}
+
+static void
+test_bufferevent_openssl_filter_recv_timestamps(void *arg)
+{
+	struct basic_test_data *data = arg;
+	struct bufferevent *bev1 = NULL;
+	struct bufferevent *bev2 = NULL;
+	struct bufferevent *underlying_bev1 = NULL;
+	struct bufferevent *underlying_bev2 = NULL;
+	SSL *ssl1 = NULL, *ssl2 = NULL;
+	int done = 0;
+	evutil_socket_t fd_pair[2] = {-1, -1};
+
+ #ifdef _WIN32
+	tt_assert(evutil_socketpair(AF_INET, SOCK_STREAM, 0, fd_pair) == 0);
+ #else
+	/* Create UNIX domain socketpair */
+	tt_assert(evutil_socketpair(AF_UNIX, SOCK_STREAM, 0, fd_pair) == 0);
+ #endif
+	tt_assert(evutil_make_socket_nonblocking(fd_pair[0]) == 0);
+	tt_assert(evutil_make_socket_nonblocking(fd_pair[1]) == 0);
+
+	ssl1 = SSL_new(get_ssl_ctx());
+	ssl2 = SSL_new(get_ssl_ctx());
+	tt_assert(ssl1);
+	tt_assert(ssl2);
+
+	SSL_use_certificate(ssl2, the_cert);
+	SSL_use_PrivateKey(ssl2, the_key);
+
+	/* Create underlying socket bufferevents */
+	underlying_bev1 = bufferevent_socket_new(data->base, fd_pair[0],
+		BEV_OPT_CLOSE_ON_FREE | BEV_OPT_DEFER_CALLBACKS);
+	tt_assert(underlying_bev1);
+	fd_pair[0] = -1;
+
+	underlying_bev2 = bufferevent_socket_new(data->base, fd_pair[1],
+		BEV_OPT_CLOSE_ON_FREE | BEV_OPT_DEFER_CALLBACKS | BEV_OPT_RECV_TIMESTAMPS);
+	tt_assert(underlying_bev2);
+	fd_pair[1] = -1;
+
+	/* Create filtered openssl bufferevents that wrap the socket bufferevents */
+	bev1 = bufferevent_openssl_filter_new(data->base, underlying_bev1, ssl1,
+		BUFFEREVENT_SSL_CONNECTING,
+		BEV_OPT_CLOSE_ON_FREE | BEV_OPT_DEFER_CALLBACKS);
+	tt_assert(bev1);
+	underlying_bev1 = NULL; /* ownership transferred */
+
+	bev2 = bufferevent_openssl_filter_new(data->base, underlying_bev2, ssl2,
+		BUFFEREVENT_SSL_ACCEPTING,
+		BEV_OPT_CLOSE_ON_FREE | BEV_OPT_DEFER_CALLBACKS);
+	tt_assert(bev2);
+	underlying_bev2 = NULL; /* ownership transferred */
+
+	/* Configure callbacks for basic data flow */
+	bufferevent_setcb(bev1, NULL, NULL, test_eventcb, NULL);
+	bufferevent_setcb(bev2, bufferevent_openssl_filter_recv_timestamps_readcb, NULL, test_eventcb, &done);
+	tt_int_op(bufferevent_enable(bev1, EV_READ | EV_WRITE), ==, 0);
+	tt_int_op(bufferevent_enable(bev2, EV_READ | EV_WRITE), ==, 0);
+
+	/* Write data from bev1 */
+	tt_int_op(bufferevent_write(bev1, "test_data", 9), ==, 0);
+
+	/* Dispatch base - just ensure filtered mode with timestamp code paths works
+	 */
+	event_base_dispatch(data->base);
+
+end:
+	if (bev1) {
+		bufferevent_free(bev1);
+	}
+	if (bev2) {
+		bufferevent_free(bev2);
+	}
+	if (underlying_bev1) {
+		bufferevent_free(underlying_bev1);
+	}
+	if (underlying_bev2) {
+		bufferevent_free(underlying_bev2);
+	}
+	if (fd_pair[0] >= 0) {
+		evutil_closesocket(fd_pair[0]);
+	}
+	if (fd_pair[1] >= 0) {
+		evutil_closesocket(fd_pair[1]);
+	}
+}
+
 struct testcase_t ssl_testcases[] = {
 #define T(a) ((void *)(a))
 	{ "bufferevent_socketpair", regress_bufferevent_openssl,
@@ -1066,6 +1304,10 @@ struct testcase_t ssl_testcases[] = {
 	  TT_FORK|TT_NEED_BASE, &ssl_setup, T(REGRESS_DEFERRED_CALLBACKS) },
 	{ "bufferevent_wm_filter_defer", regress_bufferevent_openssl_wm,
 	  TT_FORK|TT_NEED_BASE, &ssl_setup, T(REGRESS_OPENSSL_FILTER|REGRESS_DEFERRED_CALLBACKS) },
+	{ "bufferevent_openssl_direct_recv_timestamps", test_bufferevent_openssl_direct_recv_timestamps,
+	  TT_FORK|TT_NEED_BASE, &ssl_setup, NULL },
+	{ "bufferevent_openssl_filter_recv_timestamps", test_bufferevent_openssl_filter_recv_timestamps,
+	  TT_FORK|TT_NEED_BASE, &ssl_setup, NULL },
 
 #undef T
 

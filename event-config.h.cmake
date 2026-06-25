@@ -81,6 +81,15 @@
 /* Define to 1 if you have the declaration of `RANDOM_UUID'. */
 #define EVENT__HAVE_DECL_RANDOM_UUID @EVENT__HAVE_DECL_RANDOM_UUID@
 
+/* Define to 1 if you have the declaration of `SO_TIMESTAMP'. */
+#define EVENT__HAVE_DECL_SO_TIMESTAMP @EVENT__HAVE_DECL_SO_TIMESTAMP@
+
+/* Define to 1 if you have the declaration of `SO_TIMESTAMPNS'. */
+#define EVENT__HAVE_DECL_SO_TIMESTAMPNS @EVENT__HAVE_DECL_SO_TIMESTAMPNS@
+
+/* Define to 1 if you have `getrandom' function. */
+#cmakedefine EVENT__HAVE_GETRANDOM 1
+
 /* Define if /dev/poll is available */
 #cmakedefine EVENT__HAVE_DEVPOLL 1
 

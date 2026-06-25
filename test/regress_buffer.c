@@ -426,6 +426,173 @@ test_evbuffer_remove_buffer_with_empty3(void *ptr)
 }
 
 static void
+test_evbuffer_pullup_with_empty(void *ptr)
+{
+	struct evbuffer *buf = NULL;
+
+	buf = evbuffer_new();
+	evbuffer_add(buf, "foo", 3);
+	evbuffer_add_reference(buf, NULL, 0, NULL, NULL);
+	evbuffer_validate(buf);
+	tt_int_op(evbuffer_get_length(buf), ==, 3);
+	tt_mem_op(evbuffer_pullup(buf, -1), ==, "foo", 3);
+
+	evbuffer_free(buf);
+	buf = evbuffer_new();
+	evbuffer_validate(buf);
+	tt_int_op(evbuffer_get_length(buf), ==, 0);
+	tt_ptr_op(evbuffer_pullup(buf, -1), ==, NULL);
+
+	evbuffer_free(buf);
+	buf = evbuffer_new();
+	evbuffer_add(buf, "foo", 3);
+	evbuffer_add_reference(buf, NULL, 0, NULL, NULL);
+	evbuffer_validate(buf);
+	tt_mem_op(evbuffer_pullup(buf, 3), ==, "foo", 3);
+
+ end:
+	if (buf) {
+		evbuffer_free(buf);
+	}
+}
+
+static void
+test_evbuffer_get_timestamp(void *ptr)
+{
+	struct evbuffer *buf = NULL;
+	struct timespec ts, ts2;
+	struct timeval tv_sleep = { 0, 10000 }; /* 10 ms */
+	int on = 1;
+	int r;
+	int ts_supported = 1;
+
+	struct sockaddr_in sin;
+	ev_socklen_t slen = sizeof(sin);
+	evutil_socket_t listener = -1;
+	evutil_socket_t fd_pair[2] = { -1, -1 };
+
+	/* 1. Ensure empty buffer returns -1 */
+	buf = evbuffer_new();
+	tt_assert(buf);
+	tt_int_op(evbuffer_get_timestamp(buf, &ts), ==, -1);
+
+	/* Create UDP loopback connection */
+	listener = socket(AF_INET, SOCK_DGRAM, 0);
+	tt_assert(listener != EVUTIL_INVALID_SOCKET);
+	memset(&sin, 0, sizeof(sin));
+	sin.sin_family = AF_INET;
+	sin.sin_addr.s_addr = htonl(0x7f000001L);
+	sin.sin_port = 0;
+	tt_assert(bind(listener, (struct sockaddr *)&sin, sizeof(sin)) == 0);
+	tt_assert(getsockname(listener, (struct sockaddr *)&sin, &slen) == 0);
+
+	fd_pair[0] = socket(AF_INET, SOCK_DGRAM, 0);
+	tt_assert(fd_pair[0] != EVUTIL_INVALID_SOCKET);
+	tt_assert(connect(fd_pair[0], (struct sockaddr *)&sin, sizeof(sin)) == 0);
+
+	fd_pair[1] = listener;
+	listener = -1;
+
+	memset(&sin, 0, sizeof(sin));
+	sin.sin_family = AF_INET;
+	sin.sin_addr.s_addr = htonl(0x7f000001L);
+	tt_assert(getsockname(fd_pair[0], (struct sockaddr *)&sin, &slen) == 0);
+	tt_assert(connect(fd_pair[1], (struct sockaddr *)&sin, sizeof(sin)) == 0);
+
+	evutil_make_socket_nonblocking(fd_pair[0]);
+	evutil_make_socket_nonblocking(fd_pair[1]);
+
+	/* 2. Configure socket option for receive timestamps */
+#ifdef SO_TIMESTAMPNS
+	if (setsockopt(fd_pair[1], SOL_SOCKET, SO_TIMESTAMPNS, &on, sizeof(on)) == -1) {
+		ts_supported = 0;
+	}
+#elif defined(SO_TIMESTAMP)
+	if (setsockopt(fd_pair[1], SOL_SOCKET, SO_TIMESTAMP, &on, sizeof(on)) == -1) {
+		ts_supported = 0;
+	}
+#else
+	ts_supported = 0;
+#endif
+
+	/* If timestamps not supported, skip the timestamp checks */
+	if (!ts_supported) {
+		tt_skip();
+		goto end;
+	}
+
+	/* 3. Send packet A */
+	r = send(fd_pair[0], "packetA", 7, 0);
+	tt_int_op(r, ==, 7);
+
+	/* Sleep briefly to let the kernel process the packet and stamp it */
+	evutil_usleep_(&tv_sleep);
+
+	/* 4. Read packet A with timestamp */
+	r = evbuffer_read_with_timestamp(buf, fd_pair[1], 1024);
+	tt_int_op(r, ==, 7);
+
+	/* 5. Fetch and verify timestamp A */
+	tt_int_op(evbuffer_get_timestamp(buf, &ts), ==, 0);
+	tt_assert(ts.tv_sec > 0);
+	TT_BLATHER(("Captured timestamp A: %lld.%09ld", (long long)ts.tv_sec, (long)ts.tv_nsec));
+
+	/* 6. Send packet B */
+	r = send(fd_pair[0], "packetB", 7, 0);
+	tt_int_op(r, ==, 7);
+
+	evutil_usleep_(&tv_sleep);
+
+	/* 7. Read packet B with timestamp */
+	r = evbuffer_read_with_timestamp(buf, fd_pair[1], 1024);
+	tt_int_op(r, ==, 7);
+
+	/* 8. Fetch timestamp and verify it still returns packet A's (oldest first) */
+	tt_int_op(evbuffer_get_timestamp(buf, &ts2), ==, 0);
+	tt_int_op(ts.tv_sec, ==, ts2.tv_sec);
+	tt_int_op(ts.tv_nsec, ==, ts2.tv_nsec);
+
+	/* 9. Drain packet A's bytes. Packet A is 7 bytes.
+	 * Draining 3 bytes should still keep packet A's timestamp. */
+	tt_int_op(evbuffer_drain(buf, 3), ==, 0);
+	tt_int_op(evbuffer_get_timestamp(buf, &ts2), ==, 0);
+	tt_int_op(ts.tv_sec, ==, ts2.tv_sec);
+	tt_int_op(ts.tv_nsec, ==, ts2.tv_nsec);
+
+	/* 10. Drain remaining 4 bytes of packet A.
+	 * Each recvmsg() call writes into its own fresh chain, so after fully
+	 * draining packet A the buffer exposes packet B's chain and its
+	 * timestamp. The timestamp must be >= packet A's timestamp. */
+	tt_int_op(evbuffer_drain(buf, 4), ==, 0);
+	tt_int_op(evbuffer_get_timestamp(buf, &ts2), ==, 0);
+	tt_assert(ts2.tv_sec >= ts.tv_sec);
+	if (ts2.tv_sec == ts.tv_sec) {
+		tt_assert(ts2.tv_nsec >= ts.tv_nsec);
+	}
+	TT_BLATHER(("Captured oldest timestamp after draining A: %lld.%09ld",
+	    (long long)ts2.tv_sec, (long)ts2.tv_nsec));
+
+	/* 11. Fully drain the buffer. Assert evbuffer_get_timestamp returns -1. */
+	tt_int_op(evbuffer_drain(buf, 7), ==, 0);
+	tt_int_op(evbuffer_get_timestamp(buf, &ts2), ==, -1);
+
+ end:
+	if (buf) {
+		evbuffer_free(buf);
+	}
+	if (listener != -1) {
+		evutil_closesocket(listener);
+	}
+	if (fd_pair[0] != -1) {
+		evutil_closesocket(fd_pair[0]);
+	}
+	if (fd_pair[1] != -1) {
+		evutil_closesocket(fd_pair[1]);
+	}
+}
+
+
+static void
 test_evbuffer_remove_buffer_with_empty_front(void *ptr)
 {
 	struct evbuffer *buf1 = NULL, *buf2 = NULL;
@@ -2761,6 +2928,8 @@ struct testcase_t evbuffer_testcases[] = {
 	{ "add_iovec", test_evbuffer_add_iovec, 0, NULL, NULL},
 	{ "copyout", test_evbuffer_copyout, 0, NULL, NULL},
 	{ "file_segment_add_cleanup_cb", test_evbuffer_file_segment_add_cleanup_cb, 0, NULL, NULL },
+	{ "pullup_with_empty", test_evbuffer_pullup_with_empty, 0, NULL, NULL },
+	{ "get_timestamp", test_evbuffer_get_timestamp, TT_FORK, &basic_setup, NULL },
 
 #define ADDFILE_TEST(name, parameters)					\
 	{ name, test_evbuffer_add_file, TT_FORK|TT_NEED_BASE,		\
