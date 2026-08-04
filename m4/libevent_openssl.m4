@@ -42,6 +42,24 @@ case "$enable_openssl" in
     CPPFLAGS_SAVE=$CPPFLAGS
     CPPFLAGS="$CPPFLAGS $OPENSSL_INCS"
     AC_CHECK_HEADERS([openssl/ssl.h], [], [have_openssl=no])
+    if test "$have_openssl" = "yes"; then
+	AC_MSG_CHECKING([whether OpenSSL is >= 3.0.0 and not LibreSSL])
+	AC_PREPROC_IFELSE(
+	    [AC_LANG_PROGRAM([[
+#include <openssl/opensslv.h>
+#if defined(LIBRESSL_VERSION_NUMBER)
+#error unsupported-libressl
+#endif
+#if OPENSSL_VERSION_NUMBER < 0x30000000L
+#error openssl-too-old
+#endif
+	    ]])],
+	    [AC_MSG_RESULT([yes])],
+	    [AC_MSG_RESULT([no])
+	     AC_MSG_ERROR([Libevent requires OpenSSL >= 3.0.0; LibreSSL is not \
+supported. Point PKG_CONFIG_PATH/CFLAGS/LDFLAGS at a suitable OpenSSL, or use \
+--disable-openssl to build without TLS support.])])
+    fi
     CPPFLAGS=$CPPFLAGS_SAVE
     AC_SUBST(OPENSSL_INCS)
     AC_SUBST(OPENSSL_LIBS)

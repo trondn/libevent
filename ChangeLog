@@ -1,3 +1,18 @@
+Changes in version 2.1.13-stable-couchbase (05 August 2026)
+
+ This release applies additional patches on top of the upstream
+ 2.1.13-stable release to add new features required by Couchbase.
+
+ Build requirement changes (bufferevent_openssl):
+ - Libevent now requires OpenSSL >= 3.0.0 to build the openssl
+   bufferevent backend; older OpenSSL 1.x releases and LibreSSL
+   are no longer supported.
+ - CMake and Autotools now check the OpenSSL version (and reject
+   LibreSSL) at configure time, instead of failing later with a
+   compiler error in openssl-compat.h.
+
+
+
 Changes in version 2.1.13-stable (01 July 2026)
 
  This release contains several security fixes, affecting users of the

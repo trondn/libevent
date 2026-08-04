@@ -841,7 +841,16 @@ if(EVENT__HAVE_EVENT_PORTS)
 endif()
 
 if (NOT EVENT__DISABLE_OPENSSL)
-    find_package(OpenSSL REQUIRED)
+    find_package(OpenSSL 3.0.0 REQUIRED)
+
+    set(CMAKE_REQUIRED_INCLUDES ${OPENSSL_INCLUDE_DIR})
+    check_symbol_exists(LIBRESSL_VERSION_NUMBER "openssl/opensslv.h" EVENT__HAVE_LIBRESSL)
+    unset(CMAKE_REQUIRED_INCLUDES)
+    if (EVENT__HAVE_LIBRESSL)
+        message(FATAL_ERROR
+            "Libevent requires OpenSSL >= 3.0.0; LibreSSL is not supported "
+            "(found headers reporting LIBRESSL_VERSION_NUMBER)")
+    endif()
 
     set(EVENT__HAVE_OPENSSL 1)
 
