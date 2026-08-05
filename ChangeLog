@@ -3,6 +3,11 @@ Changes in version 2.1.13-stable-couchbase (05 August 2026)
  This release applies additional patches on top of the upstream
  2.1.13-stable release to add new features required by Couchbase.
 
+ New features (evbuffer, bufferevent):
+ - Add kernel socket receive timestamp support via BEV_OPT_RECV_TIMESTAMPS
+   and evbuffer_get_timestamp(), for TCP socket bufferevents. Currently
+   only supported on Linux (SO_TIMESTAMPNS/SO_TIMESTAMP); unsupported
+   on other platforms.
  Build requirement changes (bufferevent_openssl):
  - Libevent now requires OpenSSL >= 3.0.0 to build the openssl
    bufferevent backend; older OpenSSL 1.x releases and LibreSSL

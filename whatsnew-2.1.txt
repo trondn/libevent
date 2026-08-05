@@ -358,6 +358,14 @@
 
   And also libevent supports openssl 1.1.
 
+  Kernel socket receive timestamp support:
+  - evbuffer_read_with_timestamp(): Reads from a socket while capturing kernel
+    receive timestamps via recvmsg() ancillary data (SO_TIMESTAMPNS / SO_TIMESTAMP).
+  - evbuffer_get_timestamp(): Retrieves the receive timestamp of the oldest data
+    chain currently stored in the buffer.
+  - BEV_OPT_RECV_TIMESTAMPS: Option flag for socket and OpenSSL bufferevents to
+    enable kernel receive timestamp collection on incoming data.
+
 1.7. New functions and features: evdns
 
   The previous evdns interface used an "open a test UDP socket" trick in

@@ -53,6 +53,16 @@
 #include <winsock2.h>
 #endif
 
+#ifdef EVENT__HAVE_SYS_SOCKET_H
+#include <sys/socket.h>
+#endif
+#ifdef EVENT__HAVE_SYS_UIO_H
+#include <sys/uio.h>
+#endif
+#ifdef EVENT__HAVE_NETINET_IN_H
+#include <netinet/in.h>
+#endif
+
 #include "event2/bufferevent.h"
 #include "event2/bufferevent_struct.h"
 #include "event2/bufferevent_ssl.h"
@@ -83,6 +93,7 @@
 
 /* every BIO type needs its own integer type value. */
 #define BIO_TYPE_LIBEVENT 57
+#define BIO_TYPE_LIBEVENT_RECVMSG (58 | BIO_TYPE_SOURCE_SINK)
 /* ???? Arguably, we should set BIO_TYPE_FILTER or BIO_TYPE_SOURCE_SINK on
  * this. */
 
@@ -229,21 +240,27 @@ bio_bufferevent_puts(BIO *b, const char *s)
 /* Method table for the bufferevent BIO */
 static BIO_METHOD *methods_bufferevent;
 
+static void
+init_methods_bufferevent(void)
+{
+	methods_bufferevent = BIO_meth_new(BIO_TYPE_LIBEVENT, "bufferevent");
+	if (methods_bufferevent == NULL) {
+		return;
+	}
+	BIO_meth_set_write(methods_bufferevent, bio_bufferevent_write);
+	BIO_meth_set_read(methods_bufferevent, bio_bufferevent_read);
+	BIO_meth_set_puts(methods_bufferevent, bio_bufferevent_puts);
+	BIO_meth_set_ctrl(methods_bufferevent, bio_bufferevent_ctrl);
+	BIO_meth_set_create(methods_bufferevent, bio_bufferevent_new);
+	BIO_meth_set_destroy(methods_bufferevent, bio_bufferevent_free);
+}
+
 /* Return the method table for the bufferevents BIO */
 static BIO_METHOD *
 BIO_s_bufferevent(void)
 {
-	if (methods_bufferevent == NULL) {
-		methods_bufferevent = BIO_meth_new(BIO_TYPE_LIBEVENT, "bufferevent");
-		if (methods_bufferevent == NULL)
-			return NULL;
-		BIO_meth_set_write(methods_bufferevent, bio_bufferevent_write);
-		BIO_meth_set_read(methods_bufferevent, bio_bufferevent_read);
-		BIO_meth_set_puts(methods_bufferevent, bio_bufferevent_puts);
-		BIO_meth_set_ctrl(methods_bufferevent, bio_bufferevent_ctrl);
-		BIO_meth_set_create(methods_bufferevent, bio_bufferevent_new);
-		BIO_meth_set_destroy(methods_bufferevent, bio_bufferevent_free);
-	}
+	static CRYPTO_ONCE once = CRYPTO_ONCE_STATIC_INIT;
+	CRYPTO_THREAD_run_once(&once, init_methods_bufferevent);
 	return methods_bufferevent;
 }
 
@@ -327,6 +344,323 @@ struct bufferevent_openssl {
 	/* If we reset fd, we sould reset state too */
 	unsigned old_state : 2;
 };
+
+struct bio_socket_recvmsg_data {
+	evutil_socket_t fd;
+	struct bufferevent_openssl *bev_ssl;
+	/* Timestamp of the oldest recvmsg() not yet consumed by do_read():
+	 * once set, it is left untouched by further recvmsg() calls until
+	 * do_read() reads and clears it, so a TLS record whose reassembly
+	 * requires several recvmsg() calls is attributed the first call's
+	 * timestamp rather than the last. */
+	struct timespec last_recv_ts;
+	int last_recv_ts_valid;
+	/* Sticky fallback: sample the timestamp attributed to a data-bearing
+	 * recvmsg() call whose bytes are still buffered inside OpenSSL,
+	 * unconsumed by do_read(). Reset to 0 by any recvmsg() call that
+	 * returns data without a cmsg timestamp while last_recv_ts_valid is
+	 * already 0, so do_read() never attributes unrelated later data to a
+	 * stale earlier timestamp. */
+	int has_recv_ts;
+};
+
+static int
+bio_socket_recvmsg_new(BIO *b)
+{
+	struct bio_socket_recvmsg_data *data = mm_calloc(1, sizeof(*data));
+	if (!data) {
+		return 0;
+	}
+	data->fd = -1;
+	data->bev_ssl = NULL;
+	data->last_recv_ts_valid = 0;
+	BIO_set_init(b, 1);
+	BIO_set_data(b, data);
+	return 1;
+}
+
+static int
+bio_socket_recvmsg_free(BIO *b)
+{
+	struct bio_socket_recvmsg_data *data;
+	if (!b) {
+		return 0;
+	}
+	data = BIO_get_data(b);
+	if (data) {
+		if (BIO_get_shutdown(b) && data->fd != EVUTIL_INVALID_SOCKET) {
+			evutil_closesocket(data->fd);
+		}
+		mm_free(data);
+		BIO_set_data(b, NULL);
+	}
+	BIO_set_init(b, 0);
+	return 1;
+}
+
+static int
+bio_socket_recvmsg_read(BIO *b, char *out, int outlen)
+{
+	struct bio_socket_recvmsg_data *data = BIO_get_data(b);
+	int r;
+	if (!data || data->fd < 0) {
+		return -1;
+	}
+
+	BIO_clear_retry_flags(b);
+	BIO_clear_flags(b, BIO_FLAGS_IN_EOF);
+
+#if defined(_WIN32)
+	r = recv(data->fd, out, outlen, 0);
+#else
+	if (data->bev_ssl && data->bev_ssl->bev.recv_timestamps_enabled) {
+		struct msghdr msg;
+		struct iovec iov;
+		union {
+			unsigned char buf[
+				CMSG_SPACE(sizeof(struct timespec)) +   /* SCM_TIMESTAMPNS */
+				CMSG_SPACE(sizeof(struct timeval))      /* SCM_TIMESTAMP */
+			];
+			struct cmsghdr align;
+		} control;
+		struct timespec ts;
+		int ts_found = 0;
+
+		memset(&ts, 0, sizeof(ts));
+		iov.iov_base = out;
+		iov.iov_len = outlen;
+
+		memset(&msg, 0, sizeof(msg));
+		msg.msg_iov = &iov;
+		msg.msg_iovlen = 1;
+		msg.msg_control = control.buf;
+		msg.msg_controllen = sizeof(control);
+
+		r = recvmsg(data->fd, &msg, 0);
+
+		if (r > 0) {
+			struct cmsghdr *cmsg;
+			for (cmsg = CMSG_FIRSTHDR(&msg); cmsg; cmsg = CMSG_NXTHDR(&msg, cmsg)) {
+				if (cmsg->cmsg_level != SOL_SOCKET) {
+					continue;
+				}
+				/* MSG_CTRUNC only means the tail of the control
+				 * buffer was dropped; a cmsg we actually got
+				 * here is intact regardless of that flag, and
+				 * the cmsg_len checks below are what protect
+				 * against reading a cmsg that was itself cut
+				 * short. */
+#if EVENT__HAVE_DECL_SO_TIMESTAMPNS
+				if (cmsg->cmsg_type == SCM_TIMESTAMPNS) {
+					if (cmsg->cmsg_len < CMSG_LEN(sizeof(struct timespec))) {
+						continue;
+					}
+					ts = *(struct timespec *)(void *)CMSG_DATA(cmsg);
+					ts_found = 1;
+					continue;
+				}
+#endif
+
+#if EVENT__HAVE_DECL_SO_TIMESTAMP
+				if (cmsg->cmsg_type == SCM_TIMESTAMP) {
+					struct timeval *tv;
+					if (ts_found) {
+						/* A nanosecond-precision SCM_TIMESTAMPNS
+						 * already won; don't let a coarser
+						 * SCM_TIMESTAMP overwrite it. */
+						continue;
+					}
+					if (cmsg->cmsg_len < CMSG_LEN(sizeof(struct timeval))) {
+						continue;
+					}
+					tv = (struct timeval *)(void *)CMSG_DATA(cmsg);
+					ts.tv_sec = tv->tv_sec;
+					ts.tv_nsec = tv->tv_usec * 1000L;
+					ts_found = 1;
+					continue;
+				}
+#endif
+			}
+			if (ts_found) {
+				if (!data->last_recv_ts_valid && !data->has_recv_ts) {
+					data->last_recv_ts = ts;
+					data->last_recv_ts_valid = 1;
+					data->has_recv_ts = 1;
+				}
+				/* else: already holding an older unconsumed
+				 * timestamp ("oldest wins"); leave it as-is. */
+			} else if (!data->last_recv_ts_valid) {
+				/* This read returned data but no cmsg timestamp
+				 * (e.g. MSG_CTRUNC). do_read() already consumed
+				 * and cleared last_recv_ts_valid, but has_recv_ts
+				 * can still be sticky from that earlier recvmsg()
+				 * while its bytes are still buffered inside
+				 * OpenSSL. Clear it so do_read()'s fallback
+				 * doesn't reuse that stale timestamp for this
+				 * unrelated data. */
+				data->has_recv_ts = 0;
+			}
+		}
+	} else {
+		r = recv(data->fd, out, outlen, 0);
+	}
+#endif
+
+	if (r < 0) {
+		int err = EVUTIL_SOCKET_ERROR();
+		if (EVUTIL_ERR_RW_RETRIABLE(err)) {
+			BIO_set_retry_read(b);
+		}
+	} else if (r == 0) {
+		BIO_set_flags(b, BIO_FLAGS_IN_EOF);
+	}
+	return r;
+}
+
+static struct bio_socket_recvmsg_data *
+get_bio_recvmsg_data(SSL *ssl)
+{
+	BIO *rbio;
+	if (!ssl) {
+		return NULL;
+	}
+	rbio = SSL_get_rbio(ssl);
+	if (rbio && BIO_method_type(rbio) == BIO_TYPE_LIBEVENT_RECVMSG) {
+		return BIO_get_data(rbio);
+	}
+	return NULL;
+}
+
+/* do_write()/do_handshake() can make OpenSSL perform an incidental read
+ * on the rbio (e.g. to process a post-handshake session ticket, or to
+ * service a renegotiation) whose bytes are consumed internally and
+ * never handed back through do_read(); any timestamp bio_data recorded
+ * for such a read must not be left lying around to be misattributed to
+ * later, unrelated application data. But if bio_data already had a
+ * timestamp pending *before* the write/handshake ran, it belongs to an
+ * earlier do_read() that is still waiting on more ciphertext for the
+ * same record, and must survive untouched. So only clear whichever of
+ * the two fields this call newly set; leave alone whatever was already
+ * set beforehand. */
+static void
+clear_new_bio_recvmsg_ts(struct bio_socket_recvmsg_data *bio_data,
+    int had_last_recv_ts_valid, int had_has_recv_ts)
+{
+	if (!bio_data) {
+		return;
+	}
+	if (!had_last_recv_ts_valid) {
+		bio_data->last_recv_ts_valid = 0;
+	}
+	if (!had_has_recv_ts) {
+		bio_data->has_recv_ts = 0;
+	}
+}
+
+static int
+bio_socket_recvmsg_write(BIO *b, const char *in, int inlen)
+{
+	struct bio_socket_recvmsg_data *data = BIO_get_data(b);
+	int r;
+	if (!data || data->fd < 0) {
+		return -1;
+	}
+
+	BIO_clear_retry_flags(b);
+	r = send(data->fd, in, inlen, 0);
+	if (r < 0) {
+		int err = EVUTIL_SOCKET_ERROR();
+		if (EVUTIL_ERR_RW_RETRIABLE(err)) {
+			BIO_set_retry_write(b);
+		}
+	}
+	return r;
+}
+
+static long
+bio_socket_recvmsg_ctrl(BIO *b, int cmd, long num, void *ptr)
+{
+	struct bio_socket_recvmsg_data *data = BIO_get_data(b);
+	long ret = 1;
+	if (!data) {
+		return 0;
+	}
+
+	switch (cmd) {
+	case BIO_C_SET_FD:
+		if (ptr) {
+			data->fd = (evutil_socket_t)(*(int *)ptr);
+		}
+		BIO_set_shutdown(b, (int)num);
+		BIO_set_init(b, 1);
+		ret = 1;
+		break;
+	case BIO_C_GET_FD:
+		if (BIO_get_init(b)) {
+			if (ptr) {
+				*(int *)ptr = (int)data->fd;
+			}
+			ret = data->fd;
+		} else {
+			ret = -1;
+		}
+		break;
+	case BIO_CTRL_GET_CLOSE:
+		ret = BIO_get_shutdown(b);
+		break;
+	case BIO_CTRL_SET_CLOSE:
+		BIO_set_shutdown(b, (int)num);
+		ret = 1;
+		break;
+	case BIO_CTRL_DUP:
+	case BIO_CTRL_FLUSH:
+		ret = 1;
+		break;
+	case BIO_CTRL_EOF:
+		ret = BIO_test_flags(b, BIO_FLAGS_IN_EOF) != 0;
+		break;
+	default:
+		ret = 0;
+		break;
+	}
+	return ret;
+}
+
+static BIO_METHOD *methods_socket_recvmsg;
+
+static void
+init_methods_socket_recvmsg(void)
+{
+	methods_socket_recvmsg =
+		BIO_meth_new(BIO_TYPE_LIBEVENT_RECVMSG, "socket_recvmsg");
+	if (methods_socket_recvmsg == NULL) {
+		return;
+	}
+	BIO_meth_set_write(methods_socket_recvmsg, bio_socket_recvmsg_write);
+	BIO_meth_set_read(methods_socket_recvmsg, bio_socket_recvmsg_read);
+	BIO_meth_set_ctrl(methods_socket_recvmsg, bio_socket_recvmsg_ctrl);
+	BIO_meth_set_create(methods_socket_recvmsg, bio_socket_recvmsg_new);
+	BIO_meth_set_destroy(methods_socket_recvmsg, bio_socket_recvmsg_free);
+}
+
+static BIO_METHOD *
+BIO_s_socket_recvmsg(void)
+{
+	static CRYPTO_ONCE once = CRYPTO_ONCE_STATIC_INIT;
+	CRYPTO_THREAD_run_once(&once, init_methods_socket_recvmsg);
+	return methods_socket_recvmsg;
+}
+
+static BIO *
+BIO_new_socket_recvmsg(evutil_socket_t fd, int close_flag)
+{
+	BIO *bio = BIO_new(BIO_s_socket_recvmsg());
+	if (!bio) {
+		return NULL;
+	}
+	BIO_int_ctrl(bio, BIO_C_SET_FD, close_flag, (int)fd);
+	return bio;
+}
 
 static int be_openssl_enable(struct bufferevent *, short);
 static int be_openssl_disable(struct bufferevent *, short);
@@ -591,8 +925,14 @@ do_read(struct bufferevent_openssl *bev_ssl, int n_to_read) {
 	struct evbuffer_iovec space[2];
 	int result = 0;
 
+	struct bio_socket_recvmsg_data *bio_data;
+	struct timespec first_ts = {0, 0};
+	int first_ts_valid = 0;
+
 	if (bev_ssl->bev.read_suspended)
 		return 0;
+
+	bio_data = get_bio_recvmsg_data(bev_ssl->ssl);
 
 	atmost = bufferevent_get_read_max_(&bev_ssl->bev);
 	if (n_to_read > atmost)
@@ -603,34 +943,80 @@ do_read(struct bufferevent_openssl *bev_ssl, int n_to_read) {
 		return OP_ERR;
 
 	for (i=0; i<n; ++i) {
+		struct timespec underlying_ts;
+		int underlying_ts_valid = 0;
 		if (bev_ssl->bev.read_suspended)
 			break;
+		if (bev_ssl->underlying &&
+		    BEV_UPCAST(bev_ssl->underlying)->recv_timestamps_enabled) {
+			/* evbuffer_get_timestamp() locks the underlying
+			 * evbuffer; only pay for that when the underlying
+			 * bufferevent actually has receive timestamps armed
+			 * -- otherwise it can never find one anyway. At most
+			 * two iovecs are reserved per do_read() call, so this
+			 * is at most one extra locked call, not a per-byte
+			 * cost. */
+			if (evbuffer_get_timestamp(
+					bufferevent_get_input(bev_ssl->underlying),
+					&underlying_ts) == 0) {
+				underlying_ts_valid = 1;
+			}
+		}
 		ERR_clear_error();
 		r = SSL_read(bev_ssl->ssl, space[i].iov_base, space[i].iov_len);
 		if (r>0) {
 			result |= OP_MADE_PROGRESS;
-			if (bev_ssl->read_blocked_on_write)
-				if (clear_rbow(bev_ssl) < 0)
-					return OP_ERR | result;
+			if (bev_ssl->read_blocked_on_write) {
+				if (clear_rbow(bev_ssl) < 0) {
+					result |= OP_ERR;
+					goto out;
+				}
+			}
 			++n_used;
 			space[i].iov_len = r;
 			decrement_buckets(bev_ssl);
+
+			/* Store timestamp from first successful read (oldest data).
+			   All iovecs from the same reserve_space call are committed
+			   together, so we use the timestamp from the first read.
+			   bio_data->last_recv_ts holds the oldest not-yet-consumed
+			   recvmsg() timestamp (see bio_socket_recvmsg_data); clear it
+			   once read so the next SSL_read() starts tracking fresh. */
+			if (n_used == 1) {
+				if (bio_data && bio_data->last_recv_ts_valid) {
+					first_ts = bio_data->last_recv_ts;
+					first_ts_valid = 1;
+					bio_data->last_recv_ts_valid = 0;
+				} else if (bio_data && bio_data->has_recv_ts) {
+					first_ts = bio_data->last_recv_ts;
+					first_ts_valid = 1;
+				} else if (underlying_ts_valid) {
+					first_ts = underlying_ts;
+					first_ts_valid = 1;
+				}
+			}
 		} else {
 			int err = SSL_get_error(bev_ssl->ssl, r);
 			print_err(err);
 			switch (err) {
 			case SSL_ERROR_WANT_READ:
 				/* Can't read until underlying has more data. */
-				if (bev_ssl->read_blocked_on_write)
-					if (clear_rbow(bev_ssl) < 0)
-						return OP_ERR | result;
+				if (bev_ssl->read_blocked_on_write) {
+					if (clear_rbow(bev_ssl) < 0) {
+						result |= OP_ERR;
+						goto out;
+					}
+				}
 				break;
 			case SSL_ERROR_WANT_WRITE:
 				/* This read operation requires a write, and the
 				 * underlying is full */
-				if (!bev_ssl->read_blocked_on_write)
-					if (set_rbow(bev_ssl) < 0)
-						return OP_ERR | result;
+				if (!bev_ssl->read_blocked_on_write) {
+					if (set_rbow(bev_ssl) < 0) {
+						result |= OP_ERR;
+						goto out;
+					}
+				}
 				break;
 			default:
 				conn_closed(bev_ssl, BEV_EVENT_READING, err, r);
@@ -641,10 +1027,35 @@ do_read(struct bufferevent_openssl *bev_ssl, int n_to_read) {
 		}
 	}
 
+out:
+	/* Commit all filled iovecs together to avoid data corruption when
+	   evbuffer_reserve_space() returns multiple vectors. Individual commits
+	   can cause buffer accounting issues when the second vector is in a
+	   different chain than the first. */
 	if (n_used) {
-		evbuffer_commit_space(input, space, n_used);
-		if (bev_ssl->underlying)
+		if (first_ts_valid) {
+			evbuffer_commit_space_with_timespec(input, space, n_used, &first_ts);
+		} else {
+			evbuffer_commit_space(input, space, n_used);
+		}
+		if (bev_ssl->underlying) {
 			BEV_RESET_GENERIC_READ_TIMEOUT(bev);
+		}
+	}
+	/* has_recv_ts stays set as long as SSL_pending() has more already-
+	 * decrypted bytes left over from the recvmsg() call last_recv_ts was
+	 * captured from, so a later do_read() call still attributes them to
+	 * that timestamp instead of falling through to whatever timestamp a
+	 * subsequent, unrelated recvmsg() captures. Once SSL_pending() is
+	 * empty there is nothing left for it to protect, so retire it here;
+	 * otherwise it would stay set forever after the first timestamped
+	 * read (bio_socket_recvmsg_read() refuses to record a new timestamp
+	 * while has_recv_ts is set), and every later record would be
+	 * mis-attributed to the very first timestamp ever captured on this
+	 * connection. */
+	if (bio_data && bio_data->has_recv_ts &&
+	    SSL_pending(bev_ssl->ssl) == 0) {
+		bio_data->has_recv_ts = 0;
 	}
 
 	return result;
@@ -660,6 +1071,10 @@ do_write(struct bufferevent_openssl *bev_ssl, int atmost)
 	struct evbuffer *output = bev->output;
 	struct evbuffer_iovec space[8];
 	int result = 0;
+	struct bio_socket_recvmsg_data *bio_data =
+	    get_bio_recvmsg_data(bev_ssl->ssl);
+	int had_last_recv_ts_valid = bio_data && bio_data->last_recv_ts_valid;
+	int had_has_recv_ts = bio_data && bio_data->has_recv_ts;
 
 	if (bev_ssl->last_write > 0)
 		atmost = bev_ssl->last_write;
@@ -667,8 +1082,10 @@ do_write(struct bufferevent_openssl *bev_ssl, int atmost)
 		atmost = bufferevent_get_write_max_(&bev_ssl->bev);
 
 	n = evbuffer_peek(output, atmost, NULL, space, 8);
-	if (n < 0)
-		return OP_ERR | result;
+	if (n < 0) {
+		result |= OP_ERR;
+		goto out;
+	}
 
 	if (n > 8)
 		n = 8;
@@ -687,9 +1104,12 @@ do_write(struct bufferevent_openssl *bev_ssl, int atmost)
 		    space[i].iov_len);
 		if (r > 0) {
 			result |= OP_MADE_PROGRESS;
-			if (bev_ssl->write_blocked_on_read)
-				if (clear_wbor(bev_ssl) < 0)
-					return OP_ERR | result;
+			if (bev_ssl->write_blocked_on_read) {
+				if (clear_wbor(bev_ssl) < 0) {
+					result |= OP_ERR;
+					goto out;
+				}
+			}
 			n_written += r;
 			bev_ssl->last_write = -1;
 			decrement_buckets(bev_ssl);
@@ -699,17 +1119,23 @@ do_write(struct bufferevent_openssl *bev_ssl, int atmost)
 			switch (err) {
 			case SSL_ERROR_WANT_WRITE:
 				/* Can't read until underlying has more data. */
-				if (bev_ssl->write_blocked_on_read)
-					if (clear_wbor(bev_ssl) < 0)
-						return OP_ERR | result;
+				if (bev_ssl->write_blocked_on_read) {
+					if (clear_wbor(bev_ssl) < 0) {
+						result |= OP_ERR;
+						goto out;
+					}
+				}
 				bev_ssl->last_write = space[i].iov_len;
 				break;
 			case SSL_ERROR_WANT_READ:
 				/* This read operation requires a write, and the
 				 * underlying is full */
-				if (!bev_ssl->write_blocked_on_read)
-					if (set_wbor(bev_ssl) < 0)
-						return OP_ERR | result;
+				if (!bev_ssl->write_blocked_on_read) {
+					if (set_wbor(bev_ssl) < 0) {
+						result |= OP_ERR;
+						goto out;
+					}
+				}
 				bev_ssl->last_write = space[i].iov_len;
 				break;
 			default:
@@ -721,12 +1147,24 @@ do_write(struct bufferevent_openssl *bev_ssl, int atmost)
 			break;
 		}
 	}
+out:
 	if (n_written) {
 		evbuffer_drain(output, n_written);
 		if (bev_ssl->underlying)
 			BEV_RESET_GENERIC_WRITE_TIMEOUT(bev);
 
 		bufferevent_trigger_nolock_(bev, EV_WRITE, BEV_OPT_DEFER_CALLBACKS);
+	}
+	/* Every exit from this function (error or not) must pass through
+	 * here: do_write() may have serviced an SSL renegotiation read
+	 * before failing, so an early return that skipped this would leave
+	 * a stale recv timestamp for do_read() to misattribute later. But
+	 * if that incidental read left already-decrypted bytes in
+	 * SSL_pending() that do_read() hasn't consumed yet, the timestamp
+	 * still belongs to them -- mirrors do_handshake()'s identical
+	 * guard. */
+	if (SSL_pending(bev_ssl->ssl) == 0) {
+		clear_new_bio_recvmsg_ts(bio_data, had_last_recv_ts_valid, had_has_recv_ts);
 	}
 	return result;
 }
@@ -1021,6 +1459,10 @@ static int
 do_handshake(struct bufferevent_openssl *bev_ssl)
 {
 	int r;
+	struct bio_socket_recvmsg_data *bio_data =
+	    get_bio_recvmsg_data(bev_ssl->ssl);
+	int had_last_recv_ts_valid = bio_data && bio_data->last_recv_ts_valid;
+	int had_has_recv_ts = bio_data && bio_data->has_recv_ts;
 
 	switch (bev_ssl->state) {
 	default:
@@ -1031,6 +1473,15 @@ do_handshake(struct bufferevent_openssl *bev_ssl)
 	case BUFFEREVENT_SSL_ACCEPTING:
 		ERR_clear_error();
 		r = SSL_do_handshake(bev_ssl->ssl);
+		/* If the handshake's final read also picked up the start of
+		 * the first application-data record (peer sent both in the
+		 * same segment), that data is now sitting in OpenSSL's
+		 * internal buffer for do_read() to decrypt without a new
+		 * recvmsg() call -- don't clear the timestamp out from under
+		 * it. Mirrors do_read()'s own has_recv_ts retirement rule. */
+		if (SSL_pending(bev_ssl->ssl) == 0) {
+			clear_new_bio_recvmsg_ts(bio_data, had_last_recv_ts_valid, had_has_recv_ts);
+		}
 		break;
 	}
 	decrement_buckets(bev_ssl);
@@ -1232,6 +1683,22 @@ be_openssl_destruct(struct bufferevent *bev)
 {
 	struct bufferevent_openssl *bev_ssl = upcast(bev);
 
+	if (!bev_ssl->underlying && bev_ssl->ssl) {
+		BIO *rbio = SSL_get_rbio(bev_ssl->ssl);
+		if (rbio && BIO_method_type(rbio) == BIO_TYPE_LIBEVENT_RECVMSG) {
+			struct bio_socket_recvmsg_data *bio_data = BIO_get_data(rbio);
+			/* bufferevent teardown can be deferred to the event
+			 * loop, so a new bufferevent may already have claimed
+			 * this BIO (see bufferevent_openssl_new_impl()) by the
+			 * time this destruct runs. Only clear the pointer if
+			 * it still refers to us -- otherwise we'd null out the
+			 * new owner's reference out from under it. */
+			if (bio_data && bio_data->bev_ssl == bev_ssl) {
+				bio_data->bev_ssl = NULL;
+			}
+		}
+	}
+
 	if (bev_ssl->bev.options & BEV_OPT_CLOSE_ON_FREE) {
 		if (! bev_ssl->underlying) {
 			evutil_socket_t fd = EVUTIL_INVALID_SOCKET;
@@ -1306,8 +1773,28 @@ be_openssl_ctrl(struct bufferevent *bev,
 	case BEV_CTRL_SET_FD:
 		if (!bev_ssl->underlying) {
 			BIO *bio;
-			bio = BIO_new_socket((int)data->fd, 0);
+			if (bev_ssl->bev.options & BEV_OPT_RECV_TIMESTAMPS) {
+				if (be_socket_enable_timestamps_(data->fd) >= 0) {
+					bev_ssl->bev.recv_timestamps_enabled = 1;
+				} else {
+					bev_ssl->bev.recv_timestamps_enabled = 0;
+				}
+			}
+			if (bev_ssl->bev.recv_timestamps_enabled) {
+				bio = BIO_new_socket_recvmsg((int)data->fd, 0);
+			} else {
+				bio = BIO_new_socket((int)data->fd, 0);
+			}
+			if (!bio) {
+				return -1;
+			}
 			SSL_set_bio(bev_ssl->ssl, bio, bio);
+			if (bio && BIO_method_type(bio) == BIO_TYPE_LIBEVENT_RECVMSG) {
+				struct bio_socket_recvmsg_data *bio_data = BIO_get_data(bio);
+				if (bio_data) {
+					bio_data->bev_ssl = bev_ssl;
+				}
+			}
 		} else {
 			BIO *bio;
 			if (!(bio = BIO_new_bufferevent(bev_ssl->underlying)))
@@ -1393,6 +1880,39 @@ bufferevent_openssl_new_impl(struct event_base *base,
 	if (be_openssl_set_fd(bev_ssl, state, fd))
 		goto err;
 
+	/* The fd, if any, was already armed for SO_TIMESTAMP(NS) and the BIO
+	 * decided upon (plain socket vs. recvmsg) by our caller. Only report
+	 * timestamps as enabled if this bufferevent actually requested them
+	 * *and* the recvmsg BIO ended up installed: e.g.
+	 * bufferevent_openssl_socket_new() skips the swap for split rbio/wbio
+	 * pairs, in which case reads never go through bio_socket_recvmsg_read()
+	 * and no timestamps are ever collected. If a recvmsg BIO is present
+	 * but wasn't requested here -- e.g. inherited from a previous owner
+	 * of the same SSL object -- swap it back to a plain socket BIO so
+	 * this bufferevent doesn't silently inherit recvmsg()'s overhead. */
+	{
+		BIO *rbio = SSL_get_rbio(ssl);
+		if (rbio && BIO_method_type(rbio) == BIO_TYPE_LIBEVENT_RECVMSG) {
+			if (options & BEV_OPT_RECV_TIMESTAMPS) {
+				struct bio_socket_recvmsg_data *bio_data = BIO_get_data(rbio);
+				bev_ssl->bev.recv_timestamps_enabled = 1;
+				if (bio_data) {
+					bio_data->bev_ssl = bev_ssl;
+				}
+			} else {
+				evutil_socket_t rfd = BIO_get_fd(rbio, NULL);
+				if (rfd >= 0) {
+					int close_flag = BIO_get_shutdown(rbio);
+					BIO *plain_bio = BIO_new_socket((int)rfd, close_flag);
+					if (plain_bio) {
+						BIO_set_shutdown(rbio, 0);
+						SSL_set_bio(ssl, plain_bio, plain_bio);
+					}
+				}
+			}
+		}
+	}
+
 	if (underlying) {
 		bufferevent_setwatermark(underlying, EV_READ, 0, 0);
 		bufferevent_enable(underlying, EV_READ|EV_WRITE);
@@ -1449,6 +1969,7 @@ bufferevent_openssl_socket_new(struct event_base *base,
 	/* Does the SSL already have an fd? */
 	BIO *bio = SSL_get_wbio(ssl);
 	long have_fd = -1;
+	int recv_timestamps_enabled = 0;
 
 	if (bio)
 		have_fd = BIO_get_fd(bio, NULL);
@@ -1465,12 +1986,55 @@ bufferevent_openssl_socket_new(struct event_base *base,
 			   This is probably an error on our part.  Fail. */
 			goto err;
 		}
+		/* Only safe to arm timestamps / replace the BIO when the SSL uses
+		 * a single BIO for both directions: SSL_set_bio() below replaces
+		 * both the rbio and wbio slots, so if the caller had configured
+		 * distinct BIOs (e.g. via SSL_set_rfd()/SSL_set_wfd() or
+		 * SSL_set_bio() with a filter chain on the read side), doing this
+		 * would free the real rbio and silently redirect reads onto the
+		 * write-side fd. `fd` here comes from the write BIO, so in the
+		 * split-BIO case it isn't even the fd data is read from -- arming
+		 * SO_TIMESTAMP(NS) on it would just be a wasted/misleading
+		 * setsockopt() on the wrong socket. */
+		if ((options & BEV_OPT_RECV_TIMESTAMPS) && fd >= 0 &&
+		    SSL_get_rbio(ssl) == SSL_get_wbio(ssl) &&
+		    BIO_method_type(bio) == BIO_TYPE_SOCKET) {
+			if (be_socket_enable_timestamps_(fd) >= 0) {
+				recv_timestamps_enabled = 1;
+			}
+		}
+		if (recv_timestamps_enabled) {
+			int close_flag = BIO_get_close(bio);
+			BIO *new_bio = BIO_new_socket_recvmsg((int)fd, close_flag);
+			if (new_bio) {
+				/* Prevent the old BIO from closing fd when SSL_set_bio frees it. */
+				BIO_set_close(bio, BIO_NOCLOSE);
+				SSL_set_bio(ssl, new_bio, new_bio);
+				bio = new_bio;
+			}
+		}
+		/* fd ownership belongs to the bufferevent (via
+		 * BEV_OPT_CLOSE_ON_FREE, see be_openssl_destruct()), not to
+		 * the BIO, regardless of close_flag above or of the BIO's
+		 * type. */
 		BIO_set_close(bio, 0);
 	} else {
 		/* The SSL isn't configured with a BIO with an fd. */
 		if (fd >= 0) {
 			/* ... and we have an fd we want to use. */
-			bio = BIO_new_socket((int)fd, 0);
+			if (options & BEV_OPT_RECV_TIMESTAMPS) {
+				if (be_socket_enable_timestamps_(fd) >= 0) {
+					recv_timestamps_enabled = 1;
+				}
+			}
+			if (recv_timestamps_enabled) {
+				bio = BIO_new_socket_recvmsg((int)fd, 0);
+			} else {
+				bio = BIO_new_socket((int)fd, 0);
+			}
+			if (!bio) {
+				goto err;
+			}
 			SSL_set_bio(ssl, bio, bio);
 		} else {
 			/* Leave the fd unset. */

@@ -925,6 +925,18 @@ bufferevent_get_enabled(struct bufferevent *bufev)
 	return r;
 }
 
+int
+bufferevent_get_recv_timestamps_enabled(struct bufferevent *bev)
+{
+	struct bufferevent_private *bev_p = BEV_UPCAST(bev);
+	int r;
+
+	BEV_LOCK(bev);
+	r = bev_p->recv_timestamps_enabled;
+	BEV_UNLOCK(bev);
+	return r;
+}
+
 struct bufferevent *
 bufferevent_get_underlying(struct bufferevent *bev)
 {

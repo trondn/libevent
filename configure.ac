@@ -342,6 +342,13 @@ if test "x$ac_cv_header_sys_sysctl_h" = "xyes"; then
 	)
 fi
 
+if test "x$ac_cv_header_sys_socket_h" = "xyes"; then
+	AC_CHECK_DECLS([SO_TIMESTAMP, SO_TIMESTAMPNS], [], [],
+	   [[#include <sys/types.h>
+	     #include <sys/socket.h>]]
+	)
+fi
+
 AM_CONDITIONAL(BUILD_WIN32, test x$bwin32 = xtrue)
 AM_CONDITIONAL(BUILD_CYGWIN, test x$cygwin = xtrue)
 AM_CONDITIONAL(BUILD_MIDIPIX, test x$midipix = xtrue)

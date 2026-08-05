@@ -988,6 +988,616 @@ end:
 		event_base_loop(base, EVLOOP_ONCE);
 }
 
+static void
+bufferevent_openssl_recv_timestamps_readcb(struct bufferevent *bev, void *ctx)
+{
+	int *done = ctx;
+	struct timespec ts;
+	struct evbuffer *input;
+	char tmp[32];
+	int r;
+	int ts_result;
+
+	/* Fetch and verify timestamps BEFORE draining the buffer! */
+	input = bufferevent_get_input(bev);
+	ts_result = evbuffer_get_timestamp(input, &ts);
+
+#if EVENT__HAVE_DECL_SO_TIMESTAMPNS
+	if (ts_result == 0) {
+		tt_assert(ts.tv_sec > 0);
+	}
+#else
+	tt_int_op(ts_result, ==, -1);
+#endif
+
+	r = bufferevent_read(bev, tmp, sizeof(tmp));
+	tt_int_op(r, ==, 14);
+	tt_mem_op(tmp, ==, "timestamp_test", 14);
+
+	*done = 1;
+
+ end:
+	event_base_loopexit(bufferevent_get_base(bev), NULL);
+}
+
+static void
+test_eventcb(struct bufferevent *bev, short what, void *ctx)
+{
+	TT_BLATHER(("test_eventcb: %p got event %d", bev, (int)what));
+	if (what & BEV_EVENT_ERROR) {
+		unsigned long err;
+		while ((err = ERR_get_error())) {
+			TT_BLATHER(("  SSL error: %s", ERR_error_string(err, NULL)));
+		}
+	}
+}
+
+static void
+test_bufferevent_openssl_direct_recv_timestamps(void *arg)
+{
+	struct basic_test_data *data = arg;
+	struct bufferevent *bev1 = NULL;
+	struct bufferevent *bev2 = NULL;
+	SSL *ssl1 = NULL, *ssl2 = NULL;
+	struct timespec ts;
+	int done = 0;
+	evutil_socket_t fd_pair[2] = { -1, -1 };
+
+	/* Create a TCP socketpair */
+	tt_assert(evutil_ersatz_socketpair_(AF_INET, SOCK_STREAM, 0, fd_pair) == 0);
+	tt_assert(evutil_make_socket_nonblocking(fd_pair[0]) == 0);
+	tt_assert(evutil_make_socket_nonblocking(fd_pair[1]) == 0);
+
+	ssl1 = SSL_new(get_ssl_ctx());
+	ssl2 = SSL_new(get_ssl_ctx());
+	tt_assert(ssl1);
+	tt_assert(ssl2);
+
+	SSL_use_certificate(ssl2, the_cert);
+	SSL_use_PrivateKey(ssl2, the_key);
+
+	/* Create direct socket openssl bufferevents.
+	 * bev2 has BEV_OPT_RECV_TIMESTAMPS enabled. */
+	bev1 = bufferevent_openssl_socket_new(
+		data->base, fd_pair[0], ssl1, BUFFEREVENT_SSL_CONNECTING,
+		BEV_OPT_CLOSE_ON_FREE | BEV_OPT_DEFER_CALLBACKS);
+	tt_assert(bev1);
+	fd_pair[0] = -1;
+
+	bev2 = bufferevent_openssl_socket_new(
+		data->base, fd_pair[1], ssl2, BUFFEREVENT_SSL_ACCEPTING,
+		BEV_OPT_CLOSE_ON_FREE | BEV_OPT_DEFER_CALLBACKS | BEV_OPT_RECV_TIMESTAMPS);
+	tt_assert(bev2);
+	fd_pair[1] = -1;
+
+	/* Verify initially no timestamps are present */
+	tt_int_op(evbuffer_get_timestamp(bufferevent_get_input(bev2), &ts), ==, -1);
+
+	/* Configure callbacks */
+	bufferevent_setcb(bev1, NULL, NULL, test_eventcb, NULL);
+	bufferevent_setcb(bev2, bufferevent_openssl_recv_timestamps_readcb, NULL, test_eventcb, &done);
+	tt_int_op(bufferevent_enable(bev1, EV_READ|EV_WRITE), ==, 0);
+	tt_int_op(bufferevent_enable(bev2, EV_READ|EV_WRITE), ==, 0);
+
+	/* Write data from bev1 */
+	tt_int_op(bufferevent_write(bev1, "timestamp_test", 14), ==, 0);
+
+	/* Dispatch base */
+	event_base_dispatch(data->base);
+
+	tt_int_op(done, ==, 1);
+
+ end:
+	if (bev1) {
+		bufferevent_free(bev1);
+	}
+	if (bev2) {
+		bufferevent_free(bev2);
+	}
+	if (fd_pair[0] >= 0) {
+		evutil_closesocket(fd_pair[0]);
+	}
+	if (fd_pair[1] >= 0) {
+		evutil_closesocket(fd_pair[1]);
+	}
+}
+
+static void
+bufferevent_openssl_filter_recv_timestamps_readcb(struct bufferevent *bev, void *ctx)
+{
+	int *done = ctx;
+	struct timespec ts;
+	struct evbuffer *input;
+	char tmp[32];
+	int r;
+	int ts_result;
+
+	input = bufferevent_get_input(bev);
+	ts_result = evbuffer_get_timestamp(input, &ts);
+
+#if EVENT__HAVE_DECL_SO_TIMESTAMPNS
+	if (ts_result == 0) {
+		tt_assert(ts.tv_sec > 0);
+	}
+#else
+	tt_int_op(ts_result, ==, -1);
+#endif
+
+	r = bufferevent_read(bev, tmp, sizeof(tmp));
+	tt_int_op(r, ==, 9);
+	tt_mem_op(tmp, ==, "test_data", 9);
+
+	*done = 1;
+
+ end:
+	event_base_loopexit(bufferevent_get_base(bev), NULL);
+}
+
+static void
+test_bufferevent_openssl_filter_recv_timestamps(void *arg)
+{
+	struct basic_test_data *data = arg;
+	struct bufferevent *bev1 = NULL;
+	struct bufferevent *bev2 = NULL;
+	struct bufferevent *underlying_bev1 = NULL;
+	struct bufferevent *underlying_bev2 = NULL;
+	SSL *ssl1 = NULL, *ssl2 = NULL;
+	int done = 0;
+	evutil_socket_t fd_pair[2] = {-1, -1};
+
+	/* Create TCP socketpair */
+	tt_assert(evutil_ersatz_socketpair_(AF_INET, SOCK_STREAM, 0, fd_pair) == 0);
+	tt_assert(evutil_make_socket_nonblocking(fd_pair[0]) == 0);
+	tt_assert(evutil_make_socket_nonblocking(fd_pair[1]) == 0);
+
+	ssl1 = SSL_new(get_ssl_ctx());
+	ssl2 = SSL_new(get_ssl_ctx());
+	tt_assert(ssl1);
+	tt_assert(ssl2);
+
+	SSL_use_certificate(ssl2, the_cert);
+	SSL_use_PrivateKey(ssl2, the_key);
+
+	/* Create underlying socket bufferevents */
+	underlying_bev1 = bufferevent_socket_new(data->base, fd_pair[0],
+		BEV_OPT_CLOSE_ON_FREE | BEV_OPT_DEFER_CALLBACKS);
+	tt_assert(underlying_bev1);
+	fd_pair[0] = -1;
+
+	underlying_bev2 = bufferevent_socket_new(data->base, fd_pair[1],
+		BEV_OPT_CLOSE_ON_FREE | BEV_OPT_DEFER_CALLBACKS | BEV_OPT_RECV_TIMESTAMPS);
+	tt_assert(underlying_bev2);
+	fd_pair[1] = -1;
+
+	/* Create filtered openssl bufferevents that wrap the socket bufferevents */
+	bev1 = bufferevent_openssl_filter_new(data->base, underlying_bev1, ssl1,
+		BUFFEREVENT_SSL_CONNECTING,
+		BEV_OPT_CLOSE_ON_FREE | BEV_OPT_DEFER_CALLBACKS);
+	tt_assert(bev1);
+	underlying_bev1 = NULL; /* ownership transferred */
+
+	bev2 = bufferevent_openssl_filter_new(data->base, underlying_bev2, ssl2,
+		BUFFEREVENT_SSL_ACCEPTING,
+		BEV_OPT_CLOSE_ON_FREE | BEV_OPT_DEFER_CALLBACKS);
+	tt_assert(bev2);
+	underlying_bev2 = NULL; /* ownership transferred */
+
+	/* Configure callbacks for basic data flow */
+	bufferevent_setcb(bev1, NULL, NULL, test_eventcb, NULL);
+	bufferevent_setcb(bev2, bufferevent_openssl_filter_recv_timestamps_readcb, NULL, test_eventcb, &done);
+	tt_int_op(bufferevent_enable(bev1, EV_READ | EV_WRITE), ==, 0);
+	tt_int_op(bufferevent_enable(bev2, EV_READ | EV_WRITE), ==, 0);
+
+	/* Write data from bev1 */
+	tt_int_op(bufferevent_write(bev1, "test_data", 9), ==, 0);
+
+	/* Dispatch base - just ensure filtered mode with timestamp code paths works
+	 */
+	event_base_dispatch(data->base);
+
+	tt_int_op(done, ==, 1);
+
+end:
+	if (bev1) {
+		bufferevent_free(bev1);
+	}
+	if (bev2) {
+		bufferevent_free(bev2);
+	}
+	if (underlying_bev1) {
+		bufferevent_free(underlying_bev1);
+	}
+	if (underlying_bev2) {
+		bufferevent_free(underlying_bev2);
+	}
+	if (fd_pair[0] >= 0) {
+		evutil_closesocket(fd_pair[0]);
+	}
+	if (fd_pair[1] >= 0) {
+		evutil_closesocket(fd_pair[1]);
+	}
+}
+
+static void
+test_bufferevent_openssl_split_bio_recv_timestamps(void *arg)
+{
+	struct basic_test_data *data = arg;
+	struct bufferevent *bev = NULL;
+	SSL *ssl = NULL;
+	BIO *rbio = NULL, *wbio = NULL;
+	evutil_socket_t fd_r = -1, fd_w = -1;
+
+	/* Two distinct TCP sockets, so SO_TIMESTAMP can be tested on the
+	 * write-side fd while rbio/wbio remain genuinely distinct BIOs, as
+	 * happens with SSL_set_rfd()/SSL_set_wfd() or a read-side filter
+	 * chain installed via SSL_set_bio(). */
+	fd_r = socket(AF_INET, SOCK_STREAM, 0);
+	tt_assert(fd_r != EVUTIL_INVALID_SOCKET);
+	tt_assert(evutil_make_socket_nonblocking(fd_r) == 0);
+	fd_w = socket(AF_INET, SOCK_STREAM, 0);
+	tt_assert(fd_w != EVUTIL_INVALID_SOCKET);
+	tt_assert(evutil_make_socket_nonblocking(fd_w) == 0);
+
+	ssl = SSL_new(get_ssl_ctx());
+	tt_assert(ssl);
+
+	rbio = BIO_new_socket((int)fd_r, BIO_NOCLOSE);
+	tt_assert(rbio);
+	wbio = BIO_new_socket((int)fd_w, BIO_NOCLOSE);
+	tt_assert(wbio);
+	SSL_set_bio(ssl, rbio, wbio); /* ssl now owns rbio/wbio */
+
+	/* BUFFEREVENT_SSL_OPEN skips the handshake, so this only exercises
+	 * bufferevent_openssl_socket_new()'s BIO setup logic. */
+	bev = bufferevent_openssl_socket_new(data->base, -1, ssl,
+	    BUFFEREVENT_SSL_OPEN,
+	    BEV_OPT_CLOSE_ON_FREE | BEV_OPT_RECV_TIMESTAMPS);
+	tt_assert(bev);
+
+	/* The rbio/wbio must be left untouched: SSL_set_bio() replaces both
+	 * slots at once, so blindly calling it here for a split pair would
+	 * silently free the real rbio (losing any buffered read state) and
+	 * redirect reads onto the write-side fd. */
+	tt_ptr_op(SSL_get_rbio(ssl), ==, rbio);
+	tt_ptr_op(SSL_get_wbio(ssl), ==, wbio);
+
+	/* fd_w must not have had SO_TIMESTAMP(NS) armed on it either: it's
+	 * the write-side fd, not the one data is actually read from, so
+	 * arming it would just be a wasted/misleading setsockopt() on the
+	 * wrong socket. */
+	{
+		int on = 0;
+		ev_socklen_t len = sizeof(on);
+#ifdef SO_TIMESTAMPNS
+		tt_assert(getsockopt(fd_w, SOL_SOCKET, SO_TIMESTAMPNS, (void *)&on, &len) == 0);
+		tt_int_op(on, ==, 0);
+#elif defined(SO_TIMESTAMP)
+		tt_assert(getsockopt(fd_w, SOL_SOCKET, SO_TIMESTAMP, (void *)&on, &len) == 0);
+		tt_int_op(on, ==, 0);
+#endif
+	}
+
+ end:
+	if (bev) {
+		/* Frees ssl (BEV_OPT_CLOSE_ON_FREE), which frees rbio/wbio and
+		 * closes fd_w; fd_r is not owned by anything here. */
+		bufferevent_free(bev);
+	} else {
+		/* No bev means fd_w's ownership was never handed off: wbio
+		 * (if any) was created BIO_NOCLOSE, so freeing ssl does not
+		 * close it, and fd_w must be closed here instead. */
+		if (ssl) {
+			SSL_free(ssl);
+		}
+		if (fd_w != -1) {
+			evutil_closesocket(fd_w);
+		}
+	}
+	if (fd_r != -1) {
+		evutil_closesocket(fd_r);
+	}
+}
+
+static void
+bufferevent_openssl_recv_ts_interleaved_readcb(struct bufferevent *bev, void *ctx)
+{
+	struct timespec *out_ts = ctx;
+	char tmp[32];
+	int r;
+
+	/* Fetch the timestamp BEFORE draining the buffer! */
+	tt_int_op(evbuffer_get_timestamp(bufferevent_get_input(bev), out_ts), ==, 0);
+
+	r = bufferevent_read(bev, tmp, sizeof(tmp));
+	tt_int_op(r, ==, 9);
+	tt_mem_op(tmp, ==, "chunkedts", 9);
+
+ end:
+	event_base_loopexit(bufferevent_get_base(bev), NULL);
+}
+
+static void
+bufferevent_openssl_recv_ts_interleaved_eventcb(struct bufferevent *bev, short what, void *ctx)
+{
+	int *connected = ctx;
+	if (what & BEV_EVENT_CONNECTED) {
+		*connected = 1;
+	}
+	if (what & BEV_EVENT_ERROR) {
+		unsigned long err;
+		while ((err = ERR_get_error())) {
+			TT_BLATHER(("  SSL error: %s", ERR_error_string(err, NULL)));
+		}
+	}
+}
+
+/* Regression test for the bug fixed alongside this test: do_write() and
+ * do_handshake() used to unconditionally clear any BIO-cached recv
+ * timestamp, including one a still-in-progress do_read() was waiting to
+ * consume. So a write interleaved between the two recvmsg() calls needed
+ * to reassemble a single TLS record (because it arrived as two separate
+ * physical reads) would cause the record to be attributed the *second*
+ * recvmsg()'s timestamp instead of the first (oldest) one.
+ *
+ * To reproduce that deterministically:
+ *  1. Encrypt one small record via a direct SSL_write() into a memory
+ *     BIO, so we get our hands on the exact ciphertext bytes without
+ *     letting OpenSSL send them.
+ *  2. send() the first half of those bytes raw, and let the receiving
+ *     bufferevent_openssl partially read it: not enough ciphertext yet,
+ *     so SSL_read() returns WANT_READ and the timestamp of this first
+ *     read is cached, unconsumed.
+ *  3. Capture a wall-clock cutoff, then perform an ordinary write on the
+ *     *receiving* bufferevent, forcing its do_write() to run while that
+ *     cached timestamp is still pending.
+ *  4. send() the second half of the ciphertext -- necessarily stamped
+ *     with a kernel timestamp *after* the cutoff -- and let do_read()
+ *     finish reassembling the record.
+ * With the bug, the record ends up stamped with the second (post-cutoff)
+ * recvmsg()'s timestamp; with the fix, it keeps the first (pre-cutoff)
+ * one. A plain "is there a timestamp at all" check can't tell the two
+ * apart, since both would report success either way.
+ *
+ * Some platforms' kernels never deliver TCP receive timestamps at all
+ * (e.g. macOS treats SO_TIMESTAMP on SOCK_STREAM sockets as a silent
+ * no-op); a single ordinary write is used as an upfront probe for that,
+ * and the test skips instead of asserting anything meaningless if it
+ * doesn't work. */
+static void
+test_bufferevent_openssl_recv_ts_interleaved_write(void *arg)
+{
+	struct basic_test_data *data = arg;
+	struct bufferevent *bev1 = NULL;
+	struct bufferevent *bev2 = NULL;
+	SSL *ssl1 = NULL, *ssl2 = NULL;
+	BIO *mem_wbio = NULL;
+	struct timespec ts;
+	struct timeval cutoff;
+	char tmp[32];
+	int connected = 0;
+	int i;
+	unsigned char *ciphertext = NULL;
+	long ciphertext_len;
+	long first_len;
+	evutil_socket_t fd_send;
+	evutil_socket_t fd_pair[2] = { -1, -1 };
+	int r;
+
+	tt_assert(evutil_ersatz_socketpair_(AF_INET, SOCK_STREAM, 0, fd_pair) == 0);
+	tt_assert(evutil_make_socket_nonblocking(fd_pair[0]) == 0);
+	tt_assert(evutil_make_socket_nonblocking(fd_pair[1]) == 0);
+
+	ssl1 = SSL_new(get_ssl_ctx());
+	ssl2 = SSL_new(get_ssl_ctx());
+	tt_assert(ssl1);
+	tt_assert(ssl2);
+
+	SSL_use_certificate(ssl2, the_cert);
+	SSL_use_PrivateKey(ssl2, the_key);
+
+	/* bev1 is the sender: a plain OpenSSL client, no timestamps needed.
+	 * bev2 is the receiver under test. */
+	bev1 = bufferevent_openssl_socket_new(
+		data->base, fd_pair[0], ssl1, BUFFEREVENT_SSL_CONNECTING,
+		BEV_OPT_CLOSE_ON_FREE);
+	tt_assert(bev1);
+	fd_pair[0] = -1;
+
+	bev2 = bufferevent_openssl_socket_new(
+		data->base, fd_pair[1], ssl2, BUFFEREVENT_SSL_ACCEPTING,
+		BEV_OPT_CLOSE_ON_FREE | BEV_OPT_RECV_TIMESTAMPS);
+	tt_assert(bev2);
+	fd_pair[1] = -1;
+
+	bufferevent_setcb(bev1, NULL, NULL,
+	    bufferevent_openssl_recv_ts_interleaved_eventcb, &connected);
+	bufferevent_setcb(bev2, NULL, NULL, test_eventcb, NULL);
+	tt_int_op(bufferevent_enable(bev1, EV_READ|EV_WRITE), ==, 0);
+	tt_int_op(bufferevent_enable(bev2, EV_READ|EV_WRITE), ==, 0);
+
+	/* Drive the handshake to completion. */
+	for (i = 0; i < 100 && !connected; ++i) {
+		event_base_loop(data->base, EVLOOP_ONCE);
+	}
+	tt_assert(connected);
+
+	/* Probe: does this platform's kernel deliver TCP recv timestamps at
+	 * all? An ordinary single-shot write should get one if so. */
+	tt_int_op(bufferevent_write(bev1, "probe", 5), ==, 0);
+	for (i = 0; i < 100 && evbuffer_get_length(bufferevent_get_input(bev2)) < 5; ++i) {
+		event_base_loop(data->base, EVLOOP_ONCE);
+	}
+	tt_int_op(evbuffer_get_length(bufferevent_get_input(bev2)), ==, 5);
+	if (evbuffer_get_timestamp(bufferevent_get_input(bev2), &ts) != 0) {
+		tt_skip();
+	}
+	tt_int_op(bufferevent_read(bev2, tmp, sizeof(tmp)), ==, 5);
+
+	/* Encrypt the real test record into a memory BIO instead of letting
+	 * it go out over the wire, so we can send its ciphertext ourselves
+	 * in two separate raw chunks. */
+	mem_wbio = BIO_new(BIO_s_mem());
+	tt_assert(mem_wbio);
+	SSL_set_bio(ssl1, SSL_get_rbio(ssl1), mem_wbio); /* ssl1 now owns mem_wbio */
+
+	r = SSL_write(ssl1, "chunkedts", 9);
+	tt_int_op(r, ==, 9);
+
+	ciphertext_len = BIO_get_mem_data(mem_wbio, &ciphertext);
+	tt_assert(ciphertext_len > 1);
+	first_len = ciphertext_len / 2;
+
+	fd_send = bufferevent_getfd(bev1);
+	tt_assert(fd_send >= 0);
+
+	/* Send the first half; let bev2 partially read it (not enough
+	 * ciphertext for a full record yet, so SSL_read() returns
+	 * WANT_READ and the timestamp of this read is cached, pending). */
+	r = send(fd_send, ciphertext, first_len, 0);
+	tt_int_op(r, ==, first_len);
+	event_base_loop(data->base, EVLOOP_ONCE);
+
+	/* Everything sent after this point is necessarily stamped later by
+	 * the kernel than everything already delivered above. */
+	tt_assert(evutil_gettimeofday(&cutoff, NULL) == 0);
+
+	/* Interleave an ordinary write on bev2 -- the receiver -- forcing
+	 * its do_write() to run while the timestamp above is still
+	 * pending. */
+	tt_int_op(bufferevent_write(bev2, "X", 1), ==, 0);
+	event_base_loop(data->base, EVLOOP_ONCE);
+
+	/* Send the second half; bev2 can now finish reassembling the
+	 * record. */
+	r = send(fd_send, ciphertext + first_len, ciphertext_len - first_len, 0);
+	tt_int_op(r, ==, ciphertext_len - first_len);
+
+	bufferevent_setcb(bev2, bufferevent_openssl_recv_ts_interleaved_readcb,
+	    NULL, test_eventcb, &ts);
+	event_base_dispatch(data->base);
+
+	/* The record must be stamped with the first (pre-cutoff) recvmsg()'s
+	 * timestamp, not the second (post-cutoff) one. */
+	tt_assert(ts.tv_sec < cutoff.tv_sec ||
+	    (ts.tv_sec == cutoff.tv_sec && ts.tv_nsec < cutoff.tv_usec * 1000L));
+
+ end:
+	if (bev1) {
+		bufferevent_free(bev1);
+	}
+	if (bev2) {
+		bufferevent_free(bev2);
+	}
+	if (fd_pair[0] >= 0) {
+		evutil_closesocket(fd_pair[0]);
+	}
+	if (fd_pair[1] >= 0) {
+		evutil_closesocket(fd_pair[1]);
+	}
+}
+
+/* Regression test: has_recv_ts must be retired once SSL_pending() has no
+ * more leftover decrypted bytes from the read it was captured for.
+ * Without that, bio_socket_recvmsg_read() would refuse to ever record a
+ * new timestamp again once has_recv_ts got set once, so every record
+ * after the first would be silently mis-attributed to the very first
+ * timestamp ever captured on the connection -- two records sent well
+ * apart in time would still come back with identical timestamps. */
+static void
+test_bufferevent_openssl_recv_ts_multiple_records(void *arg)
+{
+	struct basic_test_data *data = arg;
+	struct bufferevent *bev1 = NULL;
+	struct bufferevent *bev2 = NULL;
+	SSL *ssl1 = NULL, *ssl2 = NULL;
+	struct timespec ts1, ts2;
+	struct timeval delay = { 0, 20 * 1000 };
+	char tmp[32];
+	int connected = 0;
+	int i;
+	evutil_socket_t fd_pair[2] = { -1, -1 };
+
+	tt_assert(evutil_ersatz_socketpair_(AF_INET, SOCK_STREAM, 0, fd_pair) == 0);
+	tt_assert(evutil_make_socket_nonblocking(fd_pair[0]) == 0);
+	tt_assert(evutil_make_socket_nonblocking(fd_pair[1]) == 0);
+
+	ssl1 = SSL_new(get_ssl_ctx());
+	ssl2 = SSL_new(get_ssl_ctx());
+	tt_assert(ssl1);
+	tt_assert(ssl2);
+
+	SSL_use_certificate(ssl2, the_cert);
+	SSL_use_PrivateKey(ssl2, the_key);
+
+	bev1 = bufferevent_openssl_socket_new(
+		data->base, fd_pair[0], ssl1, BUFFEREVENT_SSL_CONNECTING,
+		BEV_OPT_CLOSE_ON_FREE);
+	tt_assert(bev1);
+	fd_pair[0] = -1;
+
+	bev2 = bufferevent_openssl_socket_new(
+		data->base, fd_pair[1], ssl2, BUFFEREVENT_SSL_ACCEPTING,
+		BEV_OPT_CLOSE_ON_FREE | BEV_OPT_RECV_TIMESTAMPS);
+	tt_assert(bev2);
+	fd_pair[1] = -1;
+
+	bufferevent_setcb(bev1, NULL, NULL,
+	    bufferevent_openssl_recv_ts_interleaved_eventcb, &connected);
+	bufferevent_setcb(bev2, NULL, NULL, test_eventcb, NULL);
+	tt_int_op(bufferevent_enable(bev1, EV_READ|EV_WRITE), ==, 0);
+	tt_int_op(bufferevent_enable(bev2, EV_READ|EV_WRITE), ==, 0);
+
+	/* Drive the handshake to completion. */
+	for (i = 0; i < 100 && !connected; ++i) {
+		event_base_loop(data->base, EVLOOP_ONCE);
+	}
+	tt_assert(connected);
+
+	/* First record. */
+	tt_int_op(bufferevent_write(bev1, "record-one", 10), ==, 0);
+	for (i = 0; i < 100 && evbuffer_get_length(bufferevent_get_input(bev2)) < 10; ++i) {
+		event_base_loop(data->base, EVLOOP_ONCE);
+	}
+	tt_int_op(evbuffer_get_length(bufferevent_get_input(bev2)), ==, 10);
+	if (evbuffer_get_timestamp(bufferevent_get_input(bev2), &ts1) != 0) {
+		/* This platform/sandbox doesn't actually deliver kernel recv
+		 * timestamps at runtime; nothing to regress-test here. */
+		tt_skip();
+	}
+	tt_int_op(bufferevent_read(bev2, tmp, sizeof(tmp)), ==, 10);
+
+	/* Make sure the kernel clock actually advances before the next
+	 * record is sent, so a stuck timestamp can't accidentally read back
+	 * as correct. */
+	evutil_usleep_(&delay);
+
+	/* Second, entirely separate record. */
+	tt_int_op(bufferevent_write(bev1, "record-two", 10), ==, 0);
+	for (i = 0; i < 100 && evbuffer_get_length(bufferevent_get_input(bev2)) < 10; ++i) {
+		event_base_loop(data->base, EVLOOP_ONCE);
+	}
+	tt_int_op(evbuffer_get_length(bufferevent_get_input(bev2)), ==, 10);
+	tt_int_op(evbuffer_get_timestamp(bufferevent_get_input(bev2), &ts2), ==, 0);
+	tt_int_op(bufferevent_read(bev2, tmp, sizeof(tmp)), ==, 10);
+
+	tt_assert(ts2.tv_sec > ts1.tv_sec ||
+	    (ts2.tv_sec == ts1.tv_sec && ts2.tv_nsec > ts1.tv_nsec));
+
+ end:
+	if (bev1) {
+		bufferevent_free(bev1);
+	}
+	if (bev2) {
+		bufferevent_free(bev2);
+	}
+	if (fd_pair[0] >= 0) {
+		evutil_closesocket(fd_pair[0]);
+	}
+	if (fd_pair[1] >= 0) {
+		evutil_closesocket(fd_pair[1]);
+	}
+}
+
 struct testcase_t ssl_testcases[] = {
 #define T(a) ((void *)(a))
 	{ "bufferevent_socketpair", regress_bufferevent_openssl,
@@ -1071,6 +1681,16 @@ struct testcase_t ssl_testcases[] = {
 	  TT_FORK|TT_NEED_BASE, &ssl_setup, T(REGRESS_DEFERRED_CALLBACKS) },
 	{ "bufferevent_wm_filter_defer", regress_bufferevent_openssl_wm,
 	  TT_FORK|TT_NEED_BASE, &ssl_setup, T(REGRESS_OPENSSL_FILTER|REGRESS_DEFERRED_CALLBACKS) },
+	{ "bufferevent_openssl_direct_recv_timestamps", test_bufferevent_openssl_direct_recv_timestamps,
+	  TT_FORK|TT_NEED_BASE, &ssl_setup, NULL },
+	{ "bufferevent_openssl_filter_recv_timestamps", test_bufferevent_openssl_filter_recv_timestamps,
+	  TT_FORK|TT_NEED_BASE, &ssl_setup, NULL },
+	{ "bufferevent_openssl_split_bio_recv_timestamps", test_bufferevent_openssl_split_bio_recv_timestamps,
+	  TT_FORK|TT_NEED_BASE, &ssl_setup, NULL },
+	{ "bufferevent_openssl_recv_ts_interleaved_write", test_bufferevent_openssl_recv_ts_interleaved_write,
+	  TT_FORK|TT_NEED_BASE, &ssl_setup, NULL },
+	{ "bufferevent_openssl_recv_ts_multiple_records", test_bufferevent_openssl_recv_ts_multiple_records,
+	  TT_FORK|TT_NEED_BASE, &ssl_setup, NULL },
 
 #undef T
 

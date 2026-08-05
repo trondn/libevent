@@ -64,12 +64,14 @@
 #include "event2/util.h"
 #include "event2/bufferevent.h"
 #include "event2/buffer.h"
+#include "event2/buffer_compat.h"
 #include "event2/bufferevent_struct.h"
 #include "event2/bufferevent_compat.h"
 #include "event2/event.h"
 #include "log-internal.h"
 #include "mm-internal.h"
 #include "bufferevent-internal.h"
+#include "evbuffer-internal.h"
 #include "util-internal.h"
 #ifdef _WIN32
 #include "iocp-internal.h"
@@ -83,6 +85,95 @@ static int be_socket_flush(struct bufferevent *, short, enum bufferevent_flush_m
 static int be_socket_ctrl(struct bufferevent *, enum bufferevent_ctrl_op, union bufferevent_ctrl_data *);
 
 static void be_socket_setfd(struct bufferevent *, evutil_socket_t);
+
+/* ========================================================================
+ * Socket receive timestamp support (SO_TIMESTAMP)
+ * ======================================================================== */
+
+/* SO_TIMESTAMP on a SOCK_STREAM socket is a silent no-op on classic BSD
+ * kernels (macOS, FreeBSD, OpenBSD, NetBSD, DragonFly): setsockopt()
+ * succeeds but recvmsg() never delivers cmsgs. The SO_TYPE probe below
+ * exists only to detect that case, so compile (and pay for) it solely
+ * on the platforms where it's actually true and where SO_TIMESTAMPNS
+ * isn't available to sidestep the problem entirely -- everywhere else
+ * (notably Linux) the probe would run every time and never change the
+ * outcome. */
+#if (defined(__APPLE__) || defined(__FreeBSD__) || defined(__OpenBSD__) || \
+     defined(__NetBSD__) || defined(__DragonFly__)) && \
+    !EVENT__HAVE_DECL_SO_TIMESTAMPNS
+#define EVENT__SOCK_TIMESTAMP_STREAM_IS_NOOP_ 1
+#endif
+
+/**
+ * Enable SO_TIMESTAMP socket option for kernel receive timestamping
+ *
+ * Returns:
+ *   1 = SO_TIMESTAMPNS enabled (nanosecond precision)
+ *   0 = SO_TIMESTAMP enabled (microsecond precision)
+ *   -1 = timestamps not available on this platform
+ */
+int
+be_socket_enable_timestamps_(evutil_socket_t fd)
+{
+	int on = 1;
+#if defined(SOL_SOCKET) && defined(SO_TYPE) && defined(SOCK_STREAM)
+	int type = 0;
+	ev_socklen_t len = sizeof(type);
+#endif
+#if defined(AF_UNIX) || defined(AF_LOCAL)
+	struct sockaddr_storage ss;
+	ev_socklen_t sslen = sizeof(ss);
+#endif
+
+	if (fd < 0) {
+		return -1;
+	}
+
+#if defined(SOL_SOCKET) && defined(SO_TYPE) && defined(SOCK_STREAM)
+	if (getsockopt(fd, SOL_SOCKET, SO_TYPE, (void *)&type, &len) != 0 || type != SOCK_STREAM) {
+		/* Receive timestamps are only supported on stream (SOCK_STREAM / TCP) sockets */
+		return -1;
+	}
+#endif
+
+#if defined(AF_UNIX) || defined(AF_LOCAL)
+	if (getsockname(fd, (struct sockaddr *)&ss, &sslen) == 0) {
+#ifdef AF_UNIX
+		if (ss.ss_family == AF_UNIX) {
+			return -1;
+		}
+#endif
+#if defined(AF_LOCAL) && (AF_LOCAL != AF_UNIX)
+		if (ss.ss_family == AF_LOCAL) {
+			return -1;
+		}
+#endif
+	}
+#endif
+
+#if defined(EVENT__SOCK_TIMESTAMP_STREAM_IS_NOOP_)
+	/* On BSD systems (macOS, FreeBSD, OpenBSD, etc.), SO_TIMESTAMP on
+	 * SOCK_STREAM sockets is a silent kernel no-op: setsockopt succeeds,
+	 * but recvmsg() never delivers cmsgs. Do not pretend timestamps work. */
+	return -1;
+#endif
+
+#if EVENT__HAVE_DECL_SO_TIMESTAMPNS
+	/* Try nanosecond precision first (Linux 2.6.22+) */
+	if (setsockopt(fd, SOL_SOCKET, SO_TIMESTAMPNS, &on, sizeof(on)) == 0) {
+		return 1;
+	}
+#endif
+
+#if EVENT__HAVE_DECL_SO_TIMESTAMP
+	/* Fall back to microsecond precision */
+	if (setsockopt(fd, SOL_SOCKET, SO_TIMESTAMP, &on, sizeof(on)) == 0) {
+		return 0;
+	}
+#endif
+
+	return -1;
+}
 
 const struct bufferevent_ops bufferevent_ops_socket = {
 	"socket",
@@ -191,7 +282,15 @@ bufferevent_readcb(evutil_socket_t fd, short event, void *arg)
 		goto done;
 
 	evbuffer_unfreeze(input, 0);
-	res = evbuffer_read(input, fd, (int)howmuch); /* XXXX evbuffer_read would do better to take and return ev_ssize_t */
+
+	if (bufev_p->recv_timestamps_enabled) {
+		/* Use recvmsg() to capture timestamps */
+		res = evbuffer_read_with_timestamp_(input, fd, (int)howmuch);
+	} else {
+		/* Use standard read when timestamps not enabled */
+		res = evbuffer_read(input, fd, (int)howmuch);
+	}
+
 	evbuffer_freeze(input, 0);
 
 	if (res == -1) {
@@ -373,6 +472,13 @@ bufferevent_socket_new(struct event_base *base, evutil_socket_t fd,
 	    EV_WRITE|EV_PERSIST|EV_FINALIZE, bufferevent_writecb, bufev);
 
 	evbuffer_add_cb(bufev->output, bufferevent_socket_outbuf_cb, bufev);
+
+	/* Enable receive timestamps if requested */
+	if ((options & BEV_OPT_RECV_TIMESTAMPS) && fd >= 0) {
+		if (be_socket_enable_timestamps_(fd) >= 0) {
+			bufev_p->recv_timestamps_enabled = 1;
+		}
+	}
 
 	evbuffer_freeze(bufev->input, 0);
 	evbuffer_freeze(bufev->output, 1);
@@ -630,6 +736,15 @@ be_socket_setfd(struct bufferevent *bufev, evutil_socket_t fd)
 	BEV_LOCK(bufev);
 	EVUTIL_ASSERT(BEV_IS_SOCKET(bufev));
 
+	/* The new fd has not had timestamps armed on it yet. */
+	bufev_p->recv_timestamps_enabled = 0;
+
+	/* The input buffer's tail chain may still have undrained data and
+	 * spare capacity timestamped from the old fd; don't let a later
+	 * plain read on the new fd extend it and misattribute that
+	 * timestamp to the new fd's data. */
+	evbuffer_invalidate_last_chain_timestamp_(bufev->input);
+
 	event_del(&bufev->ev_read);
 	event_del(&bufev->ev_write);
 
@@ -641,8 +756,16 @@ be_socket_setfd(struct bufferevent *bufev, evutil_socket_t fd)
 	event_assign(&bufev->ev_write, bufev->ev_base, fd,
 	    EV_WRITE|EV_PERSIST|EV_FINALIZE, bufferevent_writecb, bufev);
 
-	if (fd >= 0)
+	if (fd >= 0) {
 		bufferevent_enable(bufev, bufev->enabled);
+
+		/* Enable receive timestamps if requested */
+		if (bufev_p->options & BEV_OPT_RECV_TIMESTAMPS) {
+			if (be_socket_enable_timestamps_(fd) >= 0) {
+				bufev_p->recv_timestamps_enabled = 1;
+			}
+		}
+	}
 
 	evutil_getaddrinfo_cancel_async_(bufev_p->dns_request);
 
