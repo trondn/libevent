@@ -235,6 +235,13 @@ if test "$ac_cv_header_sys_sysctl_h" = "yes"; then
 	)
 fi
 
+if test "$ac_cv_header_sys_socket_h" = "yes"; then
+	AC_CHECK_DECLS([SO_TIMESTAMP, SO_TIMESTAMPNS], [], [],
+	   [[#include <sys/types.h>
+	     #include <sys/socket.h>]]
+	)
+fi
+
 AM_CONDITIONAL(BUILD_WIN32, test "$bwin32" = "true")
 AM_CONDITIONAL(BUILD_CYGWIN, test "$cygwin" = "true")
 AM_CONDITIONAL(BUILD_MIDIPIX, test "$midipix" = "true")

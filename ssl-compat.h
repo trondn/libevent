@@ -30,6 +30,10 @@ struct le_ssl_ops {
 	void (*conn_closed)(
 		struct bufferevent_ssl *bev, int when, int errcode, int ret);
 	void (*print_err)(int err);
+	int (*get_recv_timestamp)(struct bufferevent_ssl *bev_ssl, struct timespec *ts);
+	void (*clear_recv_timestamp)(struct bufferevent_ssl *bev_ssl);
+	void *(*save_recv_timestamp_state)(struct bufferevent_ssl *bev_ssl);
+	void (*clear_new_recv_timestamp)(struct bufferevent_ssl *bev_ssl, void *saved_state);
 };
 
 struct bio_data_counts {
@@ -82,6 +86,10 @@ struct bufferevent_ssl {
 	unsigned old_state : 2;
 
 	ev_uint64_t flags;
+
+	/* Cached timestamp from underlying bufferevent when filtered TLS read is in progress across multiple calls */
+	struct timespec oldest_underlying_ts;
+	unsigned oldest_underlying_ts_valid : 1;
 };
 
 struct bufferevent *bufferevent_ssl_new_impl(struct event_base *base,

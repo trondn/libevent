@@ -755,6 +755,77 @@ evutil_socket_finished_connecting_(evutil_socket_t fd)
 	return 1;
 }
 
+#ifndef _WIN32
+int
+evutil_recvmsg_get_timestamp_(struct msghdr *msg, struct timespec *ts_out)
+{
+	struct cmsghdr *cmsg;
+	int ts_found = 0;
+
+	for (cmsg = CMSG_FIRSTHDR(msg); cmsg; cmsg = CMSG_NXTHDR(msg, cmsg)) {
+		if (cmsg->cmsg_level != SOL_SOCKET) {
+			continue;
+		}
+#if defined(SCM_RIGHTS)
+		if (cmsg->cmsg_type == SCM_RIGHTS) {
+			if (cmsg->cmsg_len >= CMSG_LEN(sizeof(int))) {
+				int *fds = (int *)(void *)CMSG_DATA(cmsg);
+				size_t nfds = (cmsg->cmsg_len - CMSG_LEN(0)) / sizeof(int);
+				size_t k;
+				for (k = 0; k < nfds; k++) {
+					if (fds[k] >= 0) {
+						evutil_closesocket(fds[k]);
+					}
+				}
+			}
+			continue;
+		}
+#endif
+		/* Closing SCM_RIGHTS fds above must not be skipped on
+		 * MSG_CTRUNC: fds that fit within the (possibly truncated)
+		 * control buffer have already been duplicated into this
+		 * process and must still be closed. Only the timestamp
+		 * cmsgs below are safe to skip when truncated. */
+		if (msg->msg_flags & MSG_CTRUNC) {
+			continue;
+		}
+#if EVENT__HAVE_DECL_SO_TIMESTAMPNS
+		if (cmsg->cmsg_type == SCM_TIMESTAMPNS) {
+			if (cmsg->cmsg_len < CMSG_LEN(sizeof(struct timespec))) {
+				continue;
+			}
+			*ts_out = *(struct timespec *)(void *)CMSG_DATA(cmsg);
+			ts_found = 1;
+			continue;
+		}
+#endif
+#if EVENT__HAVE_DECL_SO_TIMESTAMP
+		if (cmsg->cmsg_type == SCM_TIMESTAMP) {
+			struct timeval *tv;
+			if (ts_found) {
+				/* A nanosecond-precision SCM_TIMESTAMPNS
+				 * already won; don't let a coarser
+				 * SCM_TIMESTAMP overwrite it. Keep scanning
+				 * -- an SCM_RIGHTS cmsg may still follow in
+				 * this control buffer and must not be
+				 * skipped. */
+				continue;
+			}
+			if (cmsg->cmsg_len < CMSG_LEN(sizeof(struct timeval))) {
+				continue;
+			}
+			tv = (struct timeval *)(void *)CMSG_DATA(cmsg);
+			ts_out->tv_sec = tv->tv_sec;
+			ts_out->tv_nsec = tv->tv_usec * 1000L;
+			ts_found = 1;
+			continue;
+		}
+#endif
+	}
+	return ts_found;
+}
+#endif
+
 #if (EVUTIL_AI_PASSIVE|EVUTIL_AI_CANONNAME|EVUTIL_AI_NUMERICHOST| \
      EVUTIL_AI_NUMERICSERV|EVUTIL_AI_V4MAPPED|EVUTIL_AI_ALL| \
      EVUTIL_AI_ADDRCONFIG) != \

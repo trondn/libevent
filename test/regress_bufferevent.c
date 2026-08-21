@@ -1445,6 +1445,259 @@ end:;
 	bufferevent_free(bev);
 }
 
+static void
+bufferevent_recv_timestamps_readcb(struct bufferevent *bev, void *ctx)
+{
+	int *done = ctx;
+	struct timespec ts;
+	char tmp[32];
+	int r;
+	int ts_result;
+
+	ts_result = evbuffer_get_timestamp(bufferevent_get_input(bev), &ts);
+#if defined(__linux__) && defined(SO_TIMESTAMPNS)
+	tt_int_op(ts_result, ==, 0);
+	tt_assert(ts.tv_sec > 0);
+#else
+	tt_int_op(ts_result, ==, -1);
+#endif
+
+	r = bufferevent_read(bev, tmp, sizeof(tmp));
+	tt_int_op(r, ==, 14);
+	tt_mem_op(tmp, ==, "timestamp_test", 14);
+
+	*done = 1;
+
+ end:
+	event_base_loopexit(bufferevent_get_base(bev), NULL);
+}
+
+static void
+test_bufferevent_recv_timestamps(void *arg)
+{
+	struct basic_test_data *data = arg;
+	struct bufferevent *bev1 = NULL;
+	struct bufferevent *bev2 = NULL;
+	struct timespec ts;
+	struct timeval tv_sleep = { 0, 10000 };
+	int done = 0;
+	evutil_socket_t fd_pair[2] = { -1, -1 };
+	evutil_socket_t new_pair[2] = { -1, -1 };
+
+	/* Create TCP loopback connection */
+	tt_assert(evutil_ersatz_socketpair_(AF_INET, SOCK_STREAM, 0, fd_pair) == 0);
+	tt_assert(evutil_make_socket_nonblocking(fd_pair[0]) == 0);
+	tt_assert(evutil_make_socket_nonblocking(fd_pair[1]) == 0);
+
+	/* 1. Create bufferevents (bev2 has BEV_OPT_RECV_TIMESTAMPS enabled) */
+	bev1 = bufferevent_socket_new(data->base, fd_pair[0], BEV_OPT_CLOSE_ON_FREE);
+	tt_assert(bev1);
+	fd_pair[0] = -1; /* bev1 owns it now */
+	bev2 = bufferevent_socket_new(data->base, fd_pair[1], BEV_OPT_CLOSE_ON_FREE | BEV_OPT_RECV_TIMESTAMPS);
+	tt_assert(bev2);
+	fd_pair[1] = -1; /* bev2 owns it now */
+
+	/* 2. Verify that initially no timestamps are present */
+	tt_int_op(evbuffer_get_timestamp(bufferevent_get_input(bev2), &ts), ==, -1);
+
+	/* Allow kernel timestamping facility to initialize */
+	evutil_usleep_(&tv_sleep);
+
+	/* 3. Enable writing on bev1 and write data */
+	tt_int_op(bufferevent_enable(bev1, EV_WRITE), ==, 0);
+	tt_int_op(bufferevent_write(bev1, "timestamp_test", 14), ==, 0);
+
+	/* Configure callback and enable read on bev2 */
+	bufferevent_setcb(bev2, bufferevent_recv_timestamps_readcb, NULL, NULL, &done);
+	tt_int_op(bufferevent_enable(bev2, EV_READ), ==, 0);
+
+	/* 4. Dispatch event loop and wait for arrival */
+	event_base_dispatch(data->base);
+
+	tt_int_op(done, ==, 1);
+
+	/* 5. Swap bev2 onto a brand new fd via bufferevent_setfd() and verify
+	 * that receive timestamps get re-armed on it too: recv_timestamps_enabled
+	 * must not stay stuck "on" from the old fd and suppress the setsockopt()
+	 * on the new one. */
+	tt_assert(evutil_ersatz_socketpair_(AF_INET, SOCK_STREAM, 0, new_pair) == 0);
+	tt_assert(evutil_make_socket_nonblocking(new_pair[0]) == 0);
+	tt_assert(evutil_make_socket_nonblocking(new_pair[1]) == 0);
+
+	{
+		/* bufferevent_setfd() does not close the fd it displaces;
+		 * close it ourselves or it leaks (it's already been marked
+		 * as not owned by fd_pair[1] above, at step 1). */
+		evutil_socket_t old_fd = bufferevent_getfd(bev2);
+		tt_int_op(bufferevent_setfd(bev2, new_pair[1]), ==, 0);
+		new_pair[1] = -1; /* bev2 owns it now */
+		if (old_fd != -1) {
+			evutil_closesocket(old_fd);
+		}
+	}
+
+	/* Allow kernel timestamping facility to initialize on swapped socket */
+	evutil_usleep_(&tv_sleep);
+
+	done = 0;
+	tt_int_op(send(new_pair[0], "timestamp_test", 14, 0), ==, 14);
+	event_base_dispatch(data->base);
+	tt_int_op(done, ==, 1);
+
+ end:
+	if (bev1) {
+		bufferevent_free(bev1);
+	}
+	if (bev2) {
+		bufferevent_free(bev2);
+	}
+	if (fd_pair[0] != -1) {
+		evutil_closesocket(fd_pair[0]);
+	}
+	if (fd_pair[1] != -1) {
+		evutil_closesocket(fd_pair[1]);
+	}
+	if (new_pair[0] != -1) {
+		evutil_closesocket(new_pair[0]);
+	}
+	if (new_pair[1] != -1) {
+		evutil_closesocket(new_pair[1]);
+	}
+}
+
+static void
+test_bufferevent_recv_timestamps_udp(void *arg)
+{
+	struct basic_test_data *data = arg;
+	struct bufferevent *bev = NULL;
+	evutil_socket_t fd = socket(AF_INET, SOCK_DGRAM, 0);
+	tt_assert(fd != EVUTIL_INVALID_SOCKET);
+	tt_assert(evutil_make_socket_nonblocking(fd) == 0);
+
+	/* Verify receive timestamps are reported as unsupported for SOCK_DGRAM socket */
+	tt_int_op(be_socket_enable_timestamps_(fd), ==, -1);
+
+	bev = bufferevent_socket_new(data->base, fd, BEV_OPT_CLOSE_ON_FREE | BEV_OPT_RECV_TIMESTAMPS);
+	tt_assert(bev);
+	fd = -1; /* bev owns it */
+
+ end:
+	if (bev) {
+		bufferevent_free(bev);
+	}
+	if (fd != -1) {
+		evutil_closesocket(fd);
+	}
+}
+
+static void
+bufferevent_recv_timestamps_tcp_readcb(struct bufferevent *bev, void *ctx)
+{
+	int *done = ctx;
+	struct timespec ts;
+	char tmp[32];
+	int r;
+	int ts_result;
+
+	ts_result = evbuffer_get_timestamp(bufferevent_get_input(bev), &ts);
+#if defined(__linux__) && defined(SO_TIMESTAMPNS)
+	tt_int_op(ts_result, ==, 0);
+	tt_assert(ts.tv_sec > 0);
+#else
+	tt_int_op(ts_result, ==, -1);
+#endif
+
+	r = bufferevent_read(bev, tmp, sizeof(tmp));
+	tt_int_op(r, ==, 14);
+	tt_mem_op(tmp, ==, "timestamp_test", 14);
+
+	*done = 1;
+
+ end:
+	event_base_loopexit(bufferevent_get_base(bev), NULL);
+}
+
+static void
+test_bufferevent_recv_timestamps_tcp(void *arg)
+{
+	struct basic_test_data *data = arg;
+	struct bufferevent *bev1 = NULL;
+	struct bufferevent *bev2 = NULL;
+	int done = 0;
+	evutil_socket_t fd_pair[2] = { -1, -1 };
+
+	tt_assert(evutil_ersatz_socketpair_(AF_INET, SOCK_STREAM, 0, fd_pair) == 0);
+	tt_assert(evutil_make_socket_nonblocking(fd_pair[0]) == 0);
+	tt_assert(evutil_make_socket_nonblocking(fd_pair[1]) == 0);
+
+	bev1 = bufferevent_socket_new(data->base, fd_pair[0], BEV_OPT_CLOSE_ON_FREE);
+	tt_assert(bev1);
+	fd_pair[0] = -1;
+
+	bev2 = bufferevent_socket_new(data->base, fd_pair[1], BEV_OPT_CLOSE_ON_FREE | BEV_OPT_RECV_TIMESTAMPS);
+	tt_assert(bev2);
+	fd_pair[1] = -1;
+
+	bufferevent_setcb(bev2, bufferevent_recv_timestamps_tcp_readcb, NULL, NULL, &done);
+	tt_int_op(bufferevent_enable(bev1, EV_WRITE), ==, 0);
+	tt_int_op(bufferevent_enable(bev2, EV_READ), ==, 0);
+
+	{
+		struct timeval tv_sleep = { 0, 10000 };
+		evutil_usleep_(&tv_sleep);
+	}
+
+	tt_int_op(bufferevent_write(bev1, "timestamp_test", 14), ==, 0);
+	event_base_dispatch(data->base);
+
+	tt_int_op(done, ==, 1);
+
+ end:
+	if (bev1) {
+		bufferevent_free(bev1);
+	}
+	if (bev2) {
+		bufferevent_free(bev2);
+	}
+	if (fd_pair[0] >= 0) {
+		evutil_closesocket(fd_pair[0]);
+	}
+	if (fd_pair[1] >= 0) {
+		evutil_closesocket(fd_pair[1]);
+	}
+}
+
+#if defined(AF_UNIX)
+static void
+test_bufferevent_recv_timestamps_af_unix(void *arg)
+{
+	struct basic_test_data *data = arg;
+	struct bufferevent *bev = NULL;
+	evutil_socket_t fd_pair[2] = { -1, -1 };
+
+	if (evutil_socketpair(AF_UNIX, SOCK_STREAM, 0, fd_pair) < 0) {
+		tt_skip();
+	}
+	tt_assert(evutil_make_socket_nonblocking(fd_pair[0]) == 0);
+	tt_assert(evutil_make_socket_nonblocking(fd_pair[1]) == 0);
+
+	bev = bufferevent_socket_new(data->base, fd_pair[0], BEV_OPT_CLOSE_ON_FREE | BEV_OPT_RECV_TIMESTAMPS);
+	tt_assert(bev);
+	fd_pair[0] = -1;
+
+	/* Verify receive timestamps are reported as unsupported for AF_UNIX socket */
+	tt_int_op(be_socket_enable_timestamps_(bufferevent_getfd(bev)), ==, -1);
+
+ end:
+	if (bev) {
+		bufferevent_free(bev);
+	}
+	if (fd_pair[1] >= 0) {
+		evutil_closesocket(fd_pair[1]);
+	}
+}
+#endif
+
 struct testcase_t bufferevent_testcases[] = {
 
 	LEGACY(bufferevent, TT_ISOLATED),
@@ -1526,6 +1779,21 @@ struct testcase_t bufferevent_testcases[] = {
 
 	LEGACY(bufferevent_ratelimit_div_by_zero, TT_ISOLATED),
 	LEGACY(bufferevent_ratelimit_overflow, TT_ISOLATED),
+
+	{ "bufferevent_recv_timestamps",
+	  test_bufferevent_recv_timestamps,
+	  TT_FORK|TT_NEED_BASE, &basic_setup, NULL },
+	{ "bufferevent_recv_timestamps_tcp",
+	  test_bufferevent_recv_timestamps_tcp,
+	  TT_FORK|TT_NEED_BASE, &basic_setup, NULL },
+	{ "bufferevent_recv_timestamps_udp",
+	  test_bufferevent_recv_timestamps_udp,
+	  TT_FORK|TT_NEED_BASE, &basic_setup, NULL },
+#if defined(AF_UNIX)
+	{ "bufferevent_recv_timestamps_af_unix",
+	  test_bufferevent_recv_timestamps_af_unix,
+	  TT_FORK|TT_NEED_BASE, &basic_setup, NULL },
+#endif
 
 	END_OF_TESTCASES,
 };

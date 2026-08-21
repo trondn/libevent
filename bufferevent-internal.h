@@ -232,6 +232,9 @@ struct bufferevent_private {
 	struct sockaddr_storage conn_address;
 
 	struct evdns_getaddrinfo_request *dns_request;
+
+	/** Flag: set if receive timestamps are enabled */
+	unsigned recv_timestamps_enabled : 1;
 };
 
 /** Possible operations for a control callback. */
@@ -460,6 +463,9 @@ bufferevent_socket_set_conn_address_fd_(struct bufferevent *bev, evutil_socket_t
 EVENT2_EXPORT_SYMBOL
 int
 bufferevent_socket_set_conn_address_(struct bufferevent *bev, struct sockaddr *addr, size_t addrlen);
+
+EVENT2_EXPORT_SYMBOL
+int be_socket_enable_timestamps_(evutil_socket_t fd);
 
 
 /** Internal use: We have just successfully read data into an inbuf, so

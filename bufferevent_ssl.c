@@ -256,6 +256,13 @@ do_read(struct bufferevent_ssl *bev_ssl, int n_to_read) {
 	struct evbuffer_iovec space[2];
 	int result = 0;
 	size_t len = 0;
+	/* One timestamp per iovec/chain, not one for the whole call: space[0]
+	 * and space[1] can each be filled by a separate SSL_read() (and thus a
+	 * separate recvmsg()) made at a genuinely different real time, so a
+	 * single shared timestamp would misattribute space[1]'s data to
+	 * space[0]'s (older) read. */
+	struct timespec chain_ts[2];
+	int chain_ts_valid[2] = { 0, 0 };
 
 	if (bev_ssl->bev.read_suspended)
 		return 0;
@@ -269,18 +276,53 @@ do_read(struct bufferevent_ssl *bev_ssl, int n_to_read) {
 		return OP_ERR;
 
 	for (i = 0; i < n;) {
+		struct timespec underlying_ts;
+		int underlying_ts_valid = 0;
 		if (bev_ssl->bev.read_suspended)
 			break;
+		if (bev_ssl->underlying &&
+		    BEV_UPCAST(bev_ssl->underlying)->recv_timestamps_enabled) {
+			/* evbuffer_get_timestamp() locks the underlying
+			 * evbuffer; only pay for that when the underlying
+			 * bufferevent actually has receive timestamps armed
+			 * -- otherwise it can never find one anyway. */
+			if (bev_ssl->oldest_underlying_ts_valid) {
+				underlying_ts = bev_ssl->oldest_underlying_ts;
+				underlying_ts_valid = 1;
+			} else if (evbuffer_get_timestamp(
+					bufferevent_get_input(bev_ssl->underlying),
+					&underlying_ts) == 0) {
+				bev_ssl->oldest_underlying_ts = underlying_ts;
+				bev_ssl->oldest_underlying_ts_valid = 1;
+				underlying_ts_valid = 1;
+			}
+		}
 		bev_ssl->ssl_ops->clear_error();
 		r = bev_ssl->ssl_ops->read(
 			bev_ssl->ssl, (unsigned char *)space[i].iov_base + len, space[i].iov_len - len);
 		if (r > 0) {
 			result |= OP_MADE_PROGRESS;
 			if (bev_ssl->read_blocked_on_write)
-				if (clear_rbow(bev_ssl) < 0)
+				if (clear_rbow(bev_ssl) < 0) {
+					if (bev_ssl->ssl_ops->clear_recv_timestamp) {
+						bev_ssl->ssl_ops->clear_recv_timestamp(bev_ssl);
+					}
 					return OP_ERR | result;
+				}
 			bev_ssl->ssl_ops->decrement_buckets(bev_ssl);
 			len += r;
+			if (!chain_ts_valid[i]) {
+				struct timespec direct_ts;
+				if (bev_ssl->ssl_ops->get_recv_timestamp &&
+				    bev_ssl->ssl_ops->get_recv_timestamp(bev_ssl, &direct_ts) == 0) {
+					chain_ts[i] = direct_ts;
+					chain_ts_valid[i] = 1;
+				} else if (underlying_ts_valid) {
+					chain_ts[i] = underlying_ts;
+					chain_ts_valid[i] = 1;
+					bev_ssl->oldest_underlying_ts_valid = 0;
+				}
+			}
 			if (space[i].iov_len - len > 0) {
 				continue;
 			} else {
@@ -304,14 +346,22 @@ do_read(struct bufferevent_ssl *bev_ssl, int n_to_read) {
 			} else if (bev_ssl->ssl_ops->err_is_want_read(err)) {
 				/* Can't read until underlying has more data. */
 				if (bev_ssl->read_blocked_on_write)
-					if (clear_rbow(bev_ssl) < 0)
+					if (clear_rbow(bev_ssl) < 0) {
+						if (bev_ssl->ssl_ops->clear_recv_timestamp) {
+							bev_ssl->ssl_ops->clear_recv_timestamp(bev_ssl);
+						}
 						return OP_ERR | result;
+					}
 			} else if (bev_ssl->ssl_ops->err_is_want_write(err)) {
 				/* This read operation requires a write, and the
 				 * underlying is full */
 				if (!bev_ssl->read_blocked_on_write)
-					if (set_rbow(bev_ssl) < 0)
+					if (set_rbow(bev_ssl) < 0) {
+						if (bev_ssl->ssl_ops->clear_recv_timestamp) {
+							bev_ssl->ssl_ops->clear_recv_timestamp(bev_ssl);
+						}
 						return OP_ERR | result;
+					}
 			} else {
 				bev_ssl->ssl_ops->conn_closed(bev_ssl, BEV_EVENT_READING, err, r);
 			}
@@ -326,9 +376,23 @@ do_read(struct bufferevent_ssl *bev_ssl, int n_to_read) {
 	}
 
 	if (i) {
-		evbuffer_commit_space(input, space, i);
-		if (bev_ssl->underlying)
+		int k;
+		/* Commit each chain separately, each with its own timestamp:
+		 * a single combined commit could only take one timestamp for
+		 * every chain it covers, which is wrong whenever space[0] and
+		 * space[1] were filled by reads made at different times. */
+		for (k = 0; k < i; ++k) {
+			evbuffer_commit_space_with_timespec(input, &space[k], 1,
+			    chain_ts_valid[k] ? &chain_ts[k] : NULL);
+		}
+		if (bev_ssl->underlying) {
 			BEV_RESET_GENERIC_READ_TIMEOUT(bev);
+			bev_ssl->oldest_underlying_ts_valid = 0;
+		}
+	}
+
+	if (bev_ssl->ssl_ops->clear_recv_timestamp) {
+		bev_ssl->ssl_ops->clear_recv_timestamp(bev_ssl);
 	}
 
 	return result;
@@ -344,6 +408,10 @@ do_write(struct bufferevent_ssl *bev_ssl, int atmost)
 	struct evbuffer *output = bev->output;
 	struct evbuffer_iovec space[8];
 	int result = 0;
+	void *ts_saved_state = bev_ssl->ssl_ops->save_recv_timestamp_state ?
+		bev_ssl->ssl_ops->save_recv_timestamp_state(bev_ssl) : NULL;
+	size_t underlying_input_len_before = bev_ssl->underlying ?
+		evbuffer_get_length(bufferevent_get_input(bev_ssl->underlying)) : 0;
 
 	if (bev_ssl->last_write > 0)
 		atmost = bev_ssl->last_write;
@@ -356,8 +424,10 @@ do_write(struct bufferevent_ssl *bev_ssl, int atmost)
 	}
 
 	n = evbuffer_peek(output, atmost, NULL, space, 8);
-	if (n < 0)
-		return OP_ERR | result;
+	if (n < 0) {
+		result |= OP_ERR;
+		goto out;
+	}
 
 	if (n > 8)
 		n = 8;
@@ -378,9 +448,12 @@ do_write(struct bufferevent_ssl *bev_ssl, int atmost)
 		    space[i].iov_len);
 		if (r > 0) {
 			result |= OP_MADE_PROGRESS;
-			if (bev_ssl->write_blocked_on_read)
-				if (clear_wbor(bev_ssl) < 0)
-					return OP_ERR | result;
+			if (bev_ssl->write_blocked_on_read) {
+				if (clear_wbor(bev_ssl) < 0) {
+					result |= OP_ERR;
+					goto out;
+				}
+			}
 			n_written += r;
 			bev_ssl->last_write = -1;
 			bev_ssl->ssl_ops->decrement_buckets(bev_ssl);
@@ -393,16 +466,22 @@ do_write(struct bufferevent_ssl *bev_ssl, int atmost)
 			bev_ssl->ssl_ops->print_err(err);
 			if (bev_ssl->ssl_ops->err_is_want_write(err)) {
 				/* Can't read until underlying has more data. */
-				if (bev_ssl->write_blocked_on_read)
-					if (clear_wbor(bev_ssl) < 0)
-						return OP_ERR | result;
+				if (bev_ssl->write_blocked_on_read) {
+					if (clear_wbor(bev_ssl) < 0) {
+						result |= OP_ERR;
+						goto out;
+					}
+				}
 				bev_ssl->last_write = space[i].iov_len;
 			} else if (bev_ssl->ssl_ops->err_is_want_read(err)) {
 				/* This read operation requires a write, and the
 				 * underlying is full */
-				if (!bev_ssl->write_blocked_on_read)
-					if (set_wbor(bev_ssl) < 0)
-						return OP_ERR | result;
+				if (!bev_ssl->write_blocked_on_read) {
+					if (set_wbor(bev_ssl) < 0) {
+						result |= OP_ERR;
+						goto out;
+					}
+				}
 				bev_ssl->last_write = space[i].iov_len;
 			} else {
 				bev_ssl->ssl_ops->conn_closed(bev_ssl, BEV_EVENT_WRITING, err, r);
@@ -412,14 +491,30 @@ do_write(struct bufferevent_ssl *bev_ssl, int atmost)
 			break;
 		}
 	}
+out:
 	if (n_written) {
-		if (evbuffer_drain(output, n_written))
-			return OP_ERR | result;
+		if (evbuffer_drain(output, n_written)) {
+			result |= OP_ERR;
+		} else {
+			if (bev_ssl->underlying)
+				BEV_RESET_GENERIC_WRITE_TIMEOUT(bev);
 
-		if (bev_ssl->underlying)
-			BEV_RESET_GENERIC_WRITE_TIMEOUT(bev);
-
-		bufferevent_trigger_nolock_(bev, EV_WRITE, BEV_OPT_DEFER_CALLBACKS);
+			bufferevent_trigger_nolock_(bev, EV_WRITE, BEV_OPT_DEFER_CALLBACKS);
+		}
+	}
+	if (bev_ssl->underlying &&
+	    evbuffer_get_length(bufferevent_get_input(bev_ssl->underlying)) !=
+	    underlying_input_len_before) {
+		/* SSL_write() (e.g. to process a renegotiation or
+		 * post-handshake message interleaved with application
+		 * data) drained bytes from the underlying's input buffer
+		 * out from under us, so any timestamp we had cached for
+		 * an in-progress do_read() reassembly no longer
+		 * corresponds to the data still sitting at its head. */
+		bev_ssl->oldest_underlying_ts_valid = 0;
+	}
+	if (bev_ssl->ssl_ops->clear_new_recv_timestamp) {
+		bev_ssl->ssl_ops->clear_new_recv_timestamp(bev_ssl, ts_saved_state);
 	}
 	return result;
 }
@@ -710,6 +805,10 @@ static int
 do_handshake(struct bufferevent_ssl *bev_ssl)
 {
 	int r;
+	void *ts_saved_state = bev_ssl->ssl_ops->save_recv_timestamp_state ?
+		bev_ssl->ssl_ops->save_recv_timestamp_state(bev_ssl) : NULL;
+	size_t underlying_input_len_before = bev_ssl->underlying ?
+		evbuffer_get_length(bufferevent_get_input(bev_ssl->underlying)) : 0;
 
 	switch (bev_ssl->state) {
 	default:
@@ -720,6 +819,17 @@ do_handshake(struct bufferevent_ssl *bev_ssl)
 	case BUFFEREVENT_SSL_ACCEPTING:
 		bev_ssl->ssl_ops->clear_error();
 		r = bev_ssl->ssl_ops->handshake(bev_ssl->ssl);
+		if (bev_ssl->underlying &&
+		    evbuffer_get_length(bufferevent_get_input(bev_ssl->underlying)) !=
+		    underlying_input_len_before) {
+			/* See do_write(): a handshake read/write can drain
+			 * the underlying's input buffer, invalidating any
+			 * cached timestamp for a pending do_read() reassembly. */
+			bev_ssl->oldest_underlying_ts_valid = 0;
+		}
+		if (bev_ssl->ssl_ops->clear_new_recv_timestamp) {
+			bev_ssl->ssl_ops->clear_new_recv_timestamp(bev_ssl, ts_saved_state);
+		}
 		break;
 	}
 	bev_ssl->ssl_ops->decrement_buckets(bev_ssl);
@@ -1073,6 +1183,19 @@ bufferevent_ssl_new_impl(struct event_base *base,
 		goto err;
 
 	if (underlying) {
+		if (options & BEV_OPT_RECV_TIMESTAMPS) {
+			evutil_socket_t underlying_fd = bufferevent_getfd(underlying);
+			/* Recorded on the underlying's own options, not just its
+			 * current recv_timestamps_enabled flag, so that a later
+			 * bufferevent_setfd() on the underlying (which resets
+			 * and re-derives recv_timestamps_enabled purely from
+			 * this bitmask) re-arms timestamps instead of leaving
+			 * them silently and permanently off. */
+			BEV_UPCAST(underlying)->options |= BEV_OPT_RECV_TIMESTAMPS;
+			if (underlying_fd >= 0 && be_socket_enable_timestamps_(underlying_fd) >= 0) {
+				BEV_UPCAST(underlying)->recv_timestamps_enabled = 1;
+			}
+		}
 		bufferevent_setwatermark(underlying, EV_READ, 0, 0);
 		bufferevent_enable(underlying, EV_READ|EV_WRITE);
 		if (state == BUFFEREVENT_SSL_OPEN)

@@ -276,6 +276,17 @@
   Also there is new flag BUFFEREVENT_SSL_BATCH_WRITE, that allows to avoid
   Nagle effect in SSL.
 
+3.2. Kernel socket receive timestamp support
+
+  - evbuffer_read_with_timestamp(): Reads from a socket while capturing kernel
+    receive timestamps via recvmsg() ancillary data (SO_TIMESTAMPNS / SO_TIMESTAMP).
+  - evbuffer_get_timestamp(): Retrieves the receive timestamp of the oldest data
+    chain currently stored in the buffer.
+  - evbuffer_commit_space_with_timespec(): Commits reserved buffer space and
+    attaches a timestamp to the newly added chains.
+  - BEV_OPT_RECV_TIMESTAMPS: Option flag for socket and OpenSSL bufferevents to
+    enable kernel receive timestamp collection on incoming data.
+
 4. DNS layer
 
 4.1. TCP support

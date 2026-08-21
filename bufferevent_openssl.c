@@ -35,12 +35,26 @@
 
 #include <openssl/ssl.h>
 #include <openssl/err.h>
-#include "openssl-compat.h"
+#ifdef EVENT__HAVE_SYS_SOCKET_H
+#include <sys/socket.h>
+#endif
+#ifdef EVENT__HAVE_SYS_UIO_H
+#include <sys/uio.h>
+#endif
+#ifdef EVENT__HAVE_NETINET_IN_H
+#include <netinet/in.h>
+#endif
+#ifdef EVENT__HAVE_UNISTD_H
+#include <unistd.h>
+#endif
 
 #include "event2/bufferevent.h"
 #include "event2/bufferevent_struct.h"
 #include "event2/buffer.h"
+#include "event2/event.h"
 
+#include "mm-internal.h"
+#include "bufferevent-internal.h"
 #include "ssl-compat.h"
 
 /*
@@ -59,6 +73,7 @@
 
 /* every BIO type needs its own integer type value. */
 #define BIO_TYPE_LIBEVENT 57
+#define BIO_TYPE_LIBEVENT_RECVMSG (58 | BIO_TYPE_SOURCE_SINK)
 /* ???? Arguably, we should set BIO_TYPE_FILTER or BIO_TYPE_SOURCE_SINK on
  * this. */
 
@@ -244,6 +259,283 @@ BIO_new_bufferevent(struct bufferevent *bufferevent)
 	return result;
 }
 
+struct bio_socket_recvmsg_data {
+	evutil_socket_t fd;
+	struct bufferevent_ssl *bev_ssl;
+	/* Timestamp of the oldest recvmsg() not yet consumed by do_read():
+	 * once set, it is left untouched by further recvmsg() calls until
+	 * do_read() reads and clears it, so a TLS record whose reassembly
+	 * requires several recvmsg() calls is attributed the first call's
+	 * timestamp rather than the last. */
+	struct timespec last_recv_ts;
+	int last_recv_ts_valid;
+	/* Sticky fallback: sample the timestamp attributed to a data-bearing
+	 * recvmsg() call whose bytes are still buffered inside OpenSSL,
+	 * unconsumed by do_read(). Reset to 0 by any recvmsg() call that
+	 * returns data without a cmsg timestamp while last_recv_ts_valid is
+	 * already 0, so do_read() never attributes unrelated later data to a
+	 * stale earlier timestamp. */
+	int has_recv_ts;
+};
+
+static int
+bio_socket_recvmsg_new(BIO *b)
+{
+	struct bio_socket_recvmsg_data *data = mm_calloc(1, sizeof(*data));
+	if (!data) {
+		return 0;
+	}
+	data->fd = -1;
+	data->bev_ssl = NULL;
+	data->last_recv_ts_valid = 0;
+	BIO_set_init(b, 1);
+	BIO_set_data(b, data);
+	return 1;
+}
+
+static int
+bio_socket_recvmsg_free(BIO *b)
+{
+	struct bio_socket_recvmsg_data *data;
+	if (!b) {
+		return 0;
+	}
+	data = BIO_get_data(b);
+	if (data) {
+		if (BIO_get_shutdown(b) && data->fd != EVUTIL_INVALID_SOCKET) {
+			evutil_closesocket(data->fd);
+		}
+		mm_free(data);
+		BIO_set_data(b, NULL);
+	}
+	BIO_set_init(b, 0);
+	return 1;
+}
+
+static int
+bio_socket_recvmsg_read(BIO *b, char *out, int outlen)
+{
+	struct bio_socket_recvmsg_data *data = BIO_get_data(b);
+	int r;
+	if (!data || data->fd < 0) {
+		return -1;
+	}
+
+	BIO_clear_retry_flags(b);
+	BIO_clear_flags(b, BIO_FLAGS_IN_EOF);
+
+#if defined(_WIN32)
+	r = recv(data->fd, out, outlen, 0);
+#else
+	if (data->bev_ssl && data->bev_ssl->bev.recv_timestamps_enabled) {
+		struct msghdr msg;
+		struct iovec iov;
+		union {
+			unsigned char buf[EVUTIL_RECVMSG_TS_CMSG_SPACE_];
+			struct cmsghdr align;
+		} control;
+		struct timespec ts;
+		int ts_found = 0;
+
+		memset(&ts, 0, sizeof(ts));
+		iov.iov_base = out;
+		iov.iov_len = outlen;
+
+		memset(&msg, 0, sizeof(msg));
+		msg.msg_iov = &iov;
+		msg.msg_iovlen = 1;
+		msg.msg_control = control.buf;
+		msg.msg_controllen = sizeof(control);
+
+		r = recvmsg(data->fd, &msg, 0);
+
+		if (r > 0) {
+			ts_found = evutil_recvmsg_get_timestamp_(&msg, &ts);
+			if (ts_found) {
+				if (!data->last_recv_ts_valid && !data->has_recv_ts) {
+					data->last_recv_ts = ts;
+					data->last_recv_ts_valid = 1;
+					data->has_recv_ts = 1;
+				}
+				/* else: already holding an older unconsumed
+				 * timestamp ("oldest wins"); leave it as-is. */
+			} else if (!data->last_recv_ts_valid) {
+				/* This read returned data but no cmsg timestamp
+				 * (e.g. MSG_CTRUNC). do_read() already consumed
+				 * and cleared last_recv_ts_valid, but has_recv_ts
+				 * can still be sticky from that earlier recvmsg()
+				 * while its bytes are still buffered inside
+				 * OpenSSL. Clear it so do_read()'s fallback
+				 * doesn't reuse that stale timestamp for this
+				 * unrelated data. */
+				data->has_recv_ts = 0;
+			}
+		}
+	} else {
+		r = recv(data->fd, out, outlen, 0);
+	}
+#endif
+
+	if (r < 0) {
+		int err = EVUTIL_SOCKET_ERROR();
+		if (EVUTIL_ERR_RW_RETRIABLE(err)) {
+			BIO_set_retry_read(b);
+		}
+	} else if (r == 0) {
+		BIO_set_flags(b, BIO_FLAGS_IN_EOF);
+	}
+	return r;
+}
+
+static int
+bio_socket_recvmsg_write(BIO *b, const char *in, int inlen)
+{
+	struct bio_socket_recvmsg_data *data = BIO_get_data(b);
+	int r;
+	if (!data || data->fd < 0) {
+		return -1;
+	}
+
+	BIO_clear_retry_flags(b);
+#if defined(_WIN32)
+	r = send(data->fd, in, inlen, 0);
+#else
+	r = write(data->fd, in, inlen);
+#endif
+	if (r < 0) {
+		int err = EVUTIL_SOCKET_ERROR();
+		if (EVUTIL_ERR_RW_RETRIABLE(err)) {
+			BIO_set_retry_write(b);
+		}
+	}
+	return r;
+}
+
+static long
+bio_socket_recvmsg_ctrl(BIO *b, int cmd, long num, void *ptr)
+{
+	struct bio_socket_recvmsg_data *data = BIO_get_data(b);
+	long ret = 1;
+	if (!data) {
+		return 0;
+	}
+
+	switch (cmd) {
+	case BIO_C_SET_FD:
+		bio_socket_recvmsg_free(b);
+		data = mm_calloc(1, sizeof(*data));
+		if (!data) {
+			return 0;
+		}
+		data->fd = *((evutil_socket_t *)ptr);
+		data->bev_ssl = NULL;
+		data->last_recv_ts_valid = 0;
+		BIO_set_shutdown(b, (int)num);
+		BIO_set_data(b, data);
+		BIO_set_init(b, 1);
+		break;
+	case BIO_C_GET_FD:
+		if (BIO_get_init(b)) {
+			evutil_socket_t *fdp = (evutil_socket_t *)ptr;
+			if (fdp) {
+				*fdp = data->fd;
+			}
+			ret = data->fd;
+		} else {
+			ret = -1;
+		}
+		break;
+	case BIO_CTRL_GET_CLOSE:
+		ret = BIO_get_shutdown(b);
+		break;
+	case BIO_CTRL_SET_CLOSE:
+		BIO_set_shutdown(b, (int)num);
+		break;
+	case BIO_CTRL_DUP:
+	case BIO_CTRL_FLUSH:
+		ret = 1;
+		break;
+	default:
+		ret = 0;
+		break;
+	}
+	return ret;
+}
+
+static int
+bio_socket_recvmsg_puts(BIO *b, const char *s)
+{
+	return bio_socket_recvmsg_write(b, s, strlen(s));
+}
+
+static BIO_METHOD *methods_socket_recvmsg;
+
+static BIO_METHOD *
+BIO_s_socket_recvmsg(void)
+{
+	if (methods_socket_recvmsg == NULL) {
+		methods_socket_recvmsg = BIO_meth_new(BIO_TYPE_LIBEVENT_RECVMSG, "socket_recvmsg");
+		if (methods_socket_recvmsg == NULL) {
+			return NULL;
+		}
+		BIO_meth_set_write(methods_socket_recvmsg, bio_socket_recvmsg_write);
+		BIO_meth_set_read(methods_socket_recvmsg, bio_socket_recvmsg_read);
+		BIO_meth_set_puts(methods_socket_recvmsg, bio_socket_recvmsg_puts);
+		BIO_meth_set_ctrl(methods_socket_recvmsg, bio_socket_recvmsg_ctrl);
+		BIO_meth_set_create(methods_socket_recvmsg, bio_socket_recvmsg_new);
+		BIO_meth_set_destroy(methods_socket_recvmsg, bio_socket_recvmsg_free);
+	}
+	return methods_socket_recvmsg;
+}
+
+static BIO *
+BIO_new_socket_recvmsg(int fd, int close_flag)
+{
+	BIO *result;
+	struct bio_socket_recvmsg_data *data;
+	result = BIO_new(BIO_s_socket_recvmsg());
+	if (!result) {
+		return NULL;
+	}
+	data = BIO_get_data(result);
+	if (!data) {
+		BIO_free(result);
+		return NULL;
+	}
+	data->fd = fd;
+	BIO_set_shutdown(result, close_flag);
+	return result;
+}
+
+static struct bio_socket_recvmsg_data *
+get_bio_recvmsg_data(SSL *ssl)
+{
+	BIO *rbio;
+	if (!ssl) {
+		return NULL;
+	}
+	rbio = SSL_get_rbio(ssl);
+	if (rbio && BIO_method_type(rbio) == BIO_TYPE_LIBEVENT_RECVMSG) {
+		return BIO_get_data(rbio);
+	}
+	return NULL;
+}
+
+static void
+clear_new_bio_recvmsg_ts(struct bio_socket_recvmsg_data *bio_data,
+    int had_last_recv_ts_valid, int had_has_recv_ts)
+{
+	if (!bio_data) {
+		return;
+	}
+	if (!had_last_recv_ts_valid) {
+		bio_data->last_recv_ts_valid = 0;
+	}
+	if (!had_has_recv_ts) {
+		bio_data->has_recv_ts = 0;
+	}
+}
+
 static void
 conn_closed(struct bufferevent_ssl *bev_ssl, int when, int errcode, int ret)
 {
@@ -341,6 +633,13 @@ SSL_init(void *ssl)
 static void
 SSL_context_free(void *ssl, int flags)
 {
+	BIO *rbio = SSL_get_rbio(ssl);
+	if (rbio && BIO_method_type(rbio) == BIO_TYPE_LIBEVENT_RECVMSG) {
+		struct bio_socket_recvmsg_data *bio_data = BIO_get_data(rbio);
+		if (bio_data) {
+			bio_data->bev_ssl = NULL;
+		}
+	}
 	if (flags & BEV_OPT_CLOSE_ON_FREE)
 		SSL_free(ssl);
 }
@@ -391,12 +690,33 @@ be_openssl_bio_set_fd(struct bufferevent_ssl *bev_ssl, evutil_socket_t fd)
 {
 	if (!bev_ssl->underlying) {
 		BIO *bio;
-		bio = BIO_new_socket((int)fd, 0);
+		if (bev_ssl->bev.options & BEV_OPT_RECV_TIMESTAMPS) {
+			if (be_socket_enable_timestamps_(fd) >= 0) {
+				bev_ssl->bev.recv_timestamps_enabled = 1;
+			} else {
+				bev_ssl->bev.recv_timestamps_enabled = 0;
+			}
+		}
+		if (bev_ssl->bev.recv_timestamps_enabled) {
+			bio = BIO_new_socket_recvmsg((int)fd, 0);
+		} else {
+			bio = BIO_new_socket((int)fd, 0);
+		}
+		if (!bio) {
+			return -1;
+		}
 		SSL_set_bio(bev_ssl->ssl, bio, bio);
+		if (bio && BIO_method_type(bio) == BIO_TYPE_LIBEVENT_RECVMSG) {
+			struct bio_socket_recvmsg_data *bio_data = BIO_get_data(bio);
+			if (bio_data) {
+				bio_data->bev_ssl = bev_ssl;
+			}
+		}
 	} else {
 		BIO *bio;
-		if (!(bio = BIO_new_bufferevent(bev_ssl->underlying)))
+		if (!(bio = BIO_new_bufferevent(bev_ssl->underlying))) {
 			return -1;
+		}
 		SSL_set_bio(bev_ssl->ssl, bio, bio);
 	}
 	return 0;
@@ -405,6 +725,53 @@ be_openssl_bio_set_fd(struct bufferevent_ssl *bev_ssl, evutil_socket_t fd)
 static size_t SSL_pending_wrap(void *ssl)
 {
 	return SSL_pending(ssl);
+}
+
+static int
+be_openssl_get_recv_timestamp(struct bufferevent_ssl *bev_ssl, struct timespec *ts)
+{
+	struct bio_socket_recvmsg_data *bio_data = get_bio_recvmsg_data(bev_ssl->ssl);
+	if (!bio_data) {
+		return -1;
+	}
+	if (bio_data->last_recv_ts_valid) {
+		*ts = bio_data->last_recv_ts;
+		bio_data->last_recv_ts_valid = 0;
+		return 0;
+	} else if (bio_data->has_recv_ts) {
+		*ts = bio_data->last_recv_ts;
+		return 0;
+	}
+	return -1;
+}
+
+static void
+be_openssl_clear_recv_timestamp(struct bufferevent_ssl *bev_ssl)
+{
+	struct bio_socket_recvmsg_data *bio_data = get_bio_recvmsg_data(bev_ssl->ssl);
+	if (bio_data && bio_data->has_recv_ts && SSL_pending(bev_ssl->ssl) == 0) {
+		bio_data->has_recv_ts = 0;
+	}
+}
+
+static void *
+be_openssl_save_recv_timestamp_state(struct bufferevent_ssl *bev_ssl)
+{
+	struct bio_socket_recvmsg_data *bio_data = get_bio_recvmsg_data(bev_ssl->ssl);
+	int had_last_recv_ts_valid = bio_data && bio_data->last_recv_ts_valid;
+	int had_has_recv_ts = bio_data && bio_data->has_recv_ts;
+	uintptr_t state = (had_last_recv_ts_valid ? 1 : 0) | (had_has_recv_ts ? 2 : 0);
+	return (void *)state;
+}
+
+static void
+be_openssl_clear_new_recv_timestamp(struct bufferevent_ssl *bev_ssl, void *saved_state)
+{
+	struct bio_socket_recvmsg_data *bio_data = get_bio_recvmsg_data(bev_ssl->ssl);
+	uintptr_t state = (uintptr_t)saved_state;
+	int had_last_recv_ts_valid = (state & 1) != 0;
+	int had_has_recv_ts = (state & 2) != 0;
+	clear_new_bio_recvmsg_ts(bio_data, had_last_recv_ts_valid, had_has_recv_ts);
 }
 
 static struct le_ssl_ops le_openssl_ops = {
@@ -430,6 +797,10 @@ static struct le_ssl_ops le_openssl_ops = {
 	decrement_buckets,
 	conn_closed,
 	print_err,
+	be_openssl_get_recv_timestamp,
+	be_openssl_clear_recv_timestamp,
+	be_openssl_save_recv_timestamp_state,
+	be_openssl_clear_new_recv_timestamp,
 };
 
 struct bufferevent *
@@ -469,6 +840,8 @@ bufferevent_openssl_socket_new(struct event_base *base,
 	/* Does the SSL already have an fd? */
 	BIO *bio = SSL_get_wbio(ssl);
 	long have_fd = -1;
+	int recv_timestamps_enabled = 0;
+	struct bufferevent *bev;
 
 	if (bio)
 		have_fd = BIO_get_fd(bio, NULL);
@@ -485,20 +858,80 @@ bufferevent_openssl_socket_new(struct event_base *base,
 			   This is probably an error on our part.  Fail. */
 			goto err;
 		}
-		(void)BIO_set_close(bio, 0);
+		/* Only safe to arm timestamps / replace the BIO when the SSL uses
+		 * a single BIO for both directions: SSL_set_bio() below replaces
+		 * both the rbio and wbio slots, so if the caller had configured
+		 * distinct BIOs (e.g. via SSL_set_rfd()/SSL_set_wfd() or
+		 * SSL_set_bio() with a filter chain on the read side), doing this
+		 * would free the real rbio and silently redirect reads onto the
+		 * write-side fd. `fd` here comes from the write BIO, so in the
+		 * split-BIO case it isn't even the fd data is read from -- arming
+		 * SO_TIMESTAMP(NS) on it would just be a wasted/misleading
+		 * setsockopt() on the wrong socket. */
+		if ((options & BEV_OPT_RECV_TIMESTAMPS) && fd >= 0 &&
+		    SSL_get_rbio(ssl) == SSL_get_wbio(ssl) &&
+		    BIO_method_type(bio) == BIO_TYPE_SOCKET) {
+			if (be_socket_enable_timestamps_(fd) >= 0) {
+				recv_timestamps_enabled = 1;
+			}
+		}
+		if (recv_timestamps_enabled) {
+			int close_flag = BIO_get_close(bio);
+			BIO *new_bio = BIO_new_socket_recvmsg((int)fd, close_flag);
+			if (new_bio) {
+				/* Prevent the old BIO from closing fd when SSL_set_bio frees it. */
+				BIO_set_close(bio, BIO_NOCLOSE);
+				SSL_set_bio(ssl, new_bio, new_bio);
+				bio = new_bio;
+			}
+		}
+		/* fd ownership belongs to the bufferevent (via
+		 * BEV_OPT_CLOSE_ON_FREE, see be_openssl_destruct()), not to
+		 * the BIO, regardless of close_flag above or of the BIO's
+		 * type. */
+		BIO_set_close(bio, 0);
 	} else {
 		/* The SSL isn't configured with a BIO with an fd. */
 		if (fd >= 0) {
 			/* ... and we have an fd we want to use. */
-			bio = BIO_new_socket((int)fd, 0);
+			if (options & BEV_OPT_RECV_TIMESTAMPS) {
+				if (be_socket_enable_timestamps_(fd) >= 0) {
+					recv_timestamps_enabled = 1;
+				}
+			}
+			if (recv_timestamps_enabled) {
+				bio = BIO_new_socket_recvmsg((int)fd, 0);
+			} else {
+				bio = BIO_new_socket((int)fd, 0);
+			}
+			if (!bio) {
+				goto err;
+			}
 			SSL_set_bio(ssl, bio, bio);
 		} else {
 			/* Leave the fd unset. */
 		}
 	}
 
-	return bufferevent_ssl_new_impl(
+	bev = bufferevent_ssl_new_impl(
 		base, NULL, fd, ssl, state, options, &le_openssl_ops);
+	if (!bev) {
+		goto err;
+	}
+
+	{
+		BIO *rbio = SSL_get_rbio(ssl);
+		if (rbio && BIO_method_type(rbio) == BIO_TYPE_LIBEVENT_RECVMSG) {
+			struct bio_socket_recvmsg_data *bio_data = BIO_get_data(rbio);
+			struct bufferevent_ssl *bev_ssl = bufferevent_ssl_upcast(bev);
+			bev_ssl->bev.recv_timestamps_enabled = 1;
+			if (bio_data) {
+				bio_data->bev_ssl = bev_ssl;
+			}
+		}
+	}
+
+	return bev;
 
 err:
 	if (options & BEV_OPT_CLOSE_ON_FREE)

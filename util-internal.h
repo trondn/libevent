@@ -305,6 +305,23 @@ int evutil_socket_connect_(evutil_socket_t *fd_ptr, const struct sockaddr *sa, i
 EVENT2_EXPORT_SYMBOL
 int evutil_socket_finished_connecting_(evutil_socket_t fd);
 
+#ifndef _WIN32
+/* Walk the control messages of a completed recvmsg(), closing any
+ * SCM_RIGHTS descriptors and extracting the kernel receive timestamp
+ * (SCM_TIMESTAMPNS in preference to the coarser SCM_TIMESTAMP) if present.
+ * Returns 1 and fills in *ts_out if a timestamp was found, 0 otherwise. */
+EVENT2_EXPORT_SYMBOL
+int evutil_recvmsg_get_timestamp_(struct msghdr *msg, struct timespec *ts_out);
+
+/* Size of a recvmsg() control buffer big enough for a timestamp cmsg
+ * (SCM_TIMESTAMPNS or SCM_TIMESTAMP) plus 256 bytes of slack for other
+ * cmsg entries (SCM_RIGHTS, SCM_CREDENTIALS, etc.), so MSG_CTRUNC can't
+ * silently discard the timestamp. */
+#define EVUTIL_RECVMSG_TS_CMSG_SPACE_ \
+	(CMSG_SPACE(sizeof(struct timespec)) + \
+	 CMSG_SPACE(sizeof(struct timeval)) + 256)
+#endif
+
 #ifdef EVENT__HAVE_AFUNIX_H
 EVENT2_EXPORT_SYMBOL
 int evutil_check_working_afunix_(void);

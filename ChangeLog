@@ -1,5 +1,10 @@
 Changes in version 2.2.2-alpha (01 July 2026)
 
+ New features (evbuffer, bufferevent):
+ - Add kernel socket receive timestamp support via evbuffer_read_with_timestamp(),
+   evbuffer_get_timestamp(), evbuffer_commit_space_with_timespec(), and
+   BEV_OPT_RECV_TIMESTAMPS.
+
  This release contains several security fixes, affecting users of the
  following modules: evbuffer, bufferevent, evtag, evrpc, evdns, evhttp,
  and evws.

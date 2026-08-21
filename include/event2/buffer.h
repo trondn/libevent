@@ -347,6 +347,22 @@ int evbuffer_commit_space(struct evbuffer *buf,
     struct evbuffer_iovec *vec, int n_vecs);
 
 /**
+   Commits the space reserved by evbuffer_reserve_space() and
+   associates a timespec with the committed chains.
+
+   @param buf the evbuffer in which to reserve space.
+   @param vec one or two extents returned by evbuffer_reserve_space.
+   @param n_vecs the number of extents.
+   @param ts pointer to timespec (or NULL if not valid).
+   @return 0 on success, -1 on error
+   @see evbuffer_reserve_space()
+*/
+EVENT2_EXPORT_SYMBOL
+int evbuffer_commit_space_with_timespec(struct evbuffer *buf,
+	struct evbuffer_iovec *vec, int n_vecs,
+	const struct timespec *ts);
+
+/**
   Append data to the end of an evbuffer.
 
   @param buf the evbuffer to be appended to
@@ -780,6 +796,62 @@ int evbuffer_write_atmost(struct evbuffer *buffer, evutil_socket_t fd,
  */
 EVENT2_EXPORT_SYMBOL
 int evbuffer_read(struct evbuffer *buffer, evutil_socket_t fd, int howmuch);
+
+/**
+  Read from a file descriptor and store the result in an evbuffer,
+  recording the kernel receive timestamp of each read.
+
+  This uses recvmsg() to retrieve the SO_TIMESTAMPNS or SO_TIMESTAMP
+  ancillary data for each chunk read, so the socket's fd must already have
+  one of those socket options enabled (e.g. via BEV_OPT_RECV_TIMESTAMPS on
+  a bufferevent) for a timestamp to be captured; otherwise this behaves
+  like evbuffer_read().
+
+  This is intended for TCP stream sockets: timestamps are captured per read
+  operation and correspond to the kernel arrival time of the last segment in
+  that read. Use evbuffer_get_timestamp() to retrieve the timestamp of the
+  oldest read chain still in the buffer.
+
+  On Windows, and on platforms without <sys/uio.h>, this silently falls
+  back to a plain read with no timestamp collection.
+
+  @param buffer the evbuffer to store the result
+  @param fd the file descriptor to read from
+  @param howmuch the number of bytes to be read (if howmuch < 0 or
+				 higher than EVBUFFER_MAX_READ it is set to
+				 EVBUFFER_MAX_READ)
+  @return the number of bytes read, or -1 if an error occurred
+  @see evbuffer_read(), evbuffer_get_timestamp()
+ */
+EVENT2_EXPORT_SYMBOL
+int evbuffer_read_with_timestamp(struct evbuffer *buffer, evutil_socket_t fd,
+	int howmuch);
+
+/**
+ * Get the timestamp stored for the oldest data chain in the buffer.
+ *
+ * Returns the kernel receive timestamp associated with the oldest chain
+ * currently in the buffer. For TCP stream sockets, this is the timestamp of
+ * the last segment in the oldest read call.
+ * If the buffer is empty or no timestamp is available, returns -1.
+ *
+ * Note: Timestamps are stored per internal chain. When evbuffer_pullup()
+ * consolidates multiple chains, only the timestamp from the first (oldest)
+ * chain is preserved. Also, reads may append new data into an existing chain
+ * that does not yet have a timestamp; in that case, draining some (but not all)
+ * bytes from that chain will not change the reported timestamp.
+ *
+ * On TCP stream sockets, kernel receive timestamp delivery (e.g. via
+ * SO_TIMESTAMPNS) is best-effort; evbuffer_get_timestamp() returns -1 if
+ * the kernel did not attach timestamp metadata to the received data.
+ *
+ * @param buffer The buffer to read from
+ * @param timestamp where to store the result
+ * @return 0 success (timestamp was stored)
+ *         -1 failure (buffer empty or no timestamp available)
+ */
+EVENT2_EXPORT_SYMBOL
+int evbuffer_get_timestamp(struct evbuffer *buffer, struct timespec *timestamp);
 
 /**
    Search for a string within an evbuffer.

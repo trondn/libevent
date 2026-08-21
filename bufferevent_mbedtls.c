@@ -327,6 +327,12 @@ static struct le_ssl_ops le_mbedtls_ops = {
 	(void (*)(struct bufferevent_ssl *))mbedtls_set_ssl_noops,
 	conn_closed,
 	print_err,
+	/* Kernel receive timestamps (BEV_OPT_RECV_TIMESTAMPS) are not
+	 * implemented for the mbedTLS backend. */
+	NULL,
+	NULL,
+	NULL,
+	NULL,
 };
 
 struct bufferevent *

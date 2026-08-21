@@ -68,6 +68,12 @@
 /* Define to 1 if you have the declaration of `KERN_ARND'. */
 #define EVENT__HAVE_DECL_KERN_ARND @EVENT__HAVE_DECL_KERN_ARND@
 
+/* Define to 1 if you have the declaration of `SO_TIMESTAMP'. */
+#define EVENT__HAVE_DECL_SO_TIMESTAMP @EVENT__HAVE_DECL_SO_TIMESTAMP@
+
+/* Define to 1 if you have the declaration of `SO_TIMESTAMPNS'. */
+#define EVENT__HAVE_DECL_SO_TIMESTAMPNS @EVENT__HAVE_DECL_SO_TIMESTAMPNS@
+
 /* Define to 1 if you have `getrandom' function. */
 #cmakedefine EVENT__HAVE_GETRANDOM 1
 
