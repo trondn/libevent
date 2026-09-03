@@ -204,6 +204,15 @@ struct evbuffer_chain {
 	/** number of references to this chain */
 	int refcnt;
 
+
+	/** Timestamp support. */
+	struct {
+		/* The timespec for the oldest data in this chunk */
+		struct timespec ts;
+		/* valid is set to a non-zero value when ts is set */
+		int valid;
+	} timestamp;
+
 	/** Usually points to the read-write memory belonging to this
 	 * buffer allocated as part of the evbuffer_chain allocation.
 	 * For mmap, this can be a read-only buffer and
@@ -325,6 +334,32 @@ int evbuffer_expand_fast_(struct evbuffer *, size_t, int);
 int evbuffer_read_setup_vecs_(struct evbuffer *buf, ev_ssize_t howmuch,
     struct evbuffer_iovec *vecs, int n_vecs, struct evbuffer_chain ***chainp,
     int exact);
+
+/* Invalidate the timestamp (if any) on buf's current tail chain. See
+ * buffer.c for details on when this is needed. */
+void evbuffer_invalidate_last_chain_timestamp_(struct evbuffer *buf);
+
+/* Like evbuffer_read(), but uses recvmsg() to also capture the kernel
+ * receive timestamp (SO_TIMESTAMPNS/SO_TIMESTAMP) of each read, if the fd
+ * has one of those socket options armed (see be_socket_enable_timestamps_()
+ * in bufferevent_sock.c). Retrieve the captured timestamp via
+ * evbuffer_get_timestamp().
+ *
+ * Internal-only: reachable exclusively through bufferevent_readcb(), which
+ * only calls this once be_socket_enable_timestamps_() has confirmed the fd
+ * is a SOCK_STREAM, non-AF_UNIX socket. This matters because recvmsg() also
+ * retrieves any SCM_RIGHTS ancillary data as a side effect, and that cmsg
+ * is not otherwise handled here (see buffer.c); SCM_RIGHTS can only ever
+ * arrive on an AF_UNIX socket, so this restriction is what makes it safe to
+ * leave unhandled. Do not expose this as a public API without re-adding
+ * SCM_RIGHTS handling for arbitrary caller-supplied fds.
+ *
+ * Marked EVENT2_EXPORT_SYMBOL (matching be_socket_enable_timestamps_()) so
+ * the test suite can call it directly despite not being in the public
+ * header; this does not add it to the documented/public API. */
+EVENT2_EXPORT_SYMBOL
+int evbuffer_read_with_timestamp_(struct evbuffer *buffer, evutil_socket_t fd,
+    int howmuch);
 
 /* Helper macro: copies an evbuffer_iovec in ei to a win32 WSABUF in i. */
 #define WSABUF_FROM_EVBUFFER_IOV(i,ei) do {		\

@@ -322,7 +322,24 @@ evbuffer_reserve_space(struct evbuffer *buf, ev_ssize_t size,
 */
 EVENT2_EXPORT_SYMBOL
 int evbuffer_commit_space(struct evbuffer *buf,
-    struct evbuffer_iovec *vec, int n_vecs);
+	struct evbuffer_iovec *vec, int n_vecs);
+
+/**
+   Commits the space reserved by evbuffer_reserve_space() and
+   associates a timespec with the committed chains.
+
+   @param buf the evbuffer in which to reserve space.
+   @param vec one or two extents returned by evbuffer_reserve_space.
+   @param n_vecs the number of extents.
+   @param ts pointer to timespec (or NULL if not valid).
+   @return 0 on success, -1 on error
+   @see evbuffer_reserve_space()
+*/
+EVENT2_EXPORT_SYMBOL
+int evbuffer_commit_space_with_timespec(struct evbuffer *buf,
+	struct evbuffer_iovec *vec, int n_vecs,
+	const struct timespec *ts);
+
 
 /**
   Append data to the end of an evbuffer.
@@ -733,6 +750,32 @@ int evbuffer_write_atmost(struct evbuffer *buffer, evutil_socket_t fd,
  */
 EVENT2_EXPORT_SYMBOL
 int evbuffer_read(struct evbuffer *buffer, evutil_socket_t fd, int howmuch);
+
+/**
+ * Get the timestamp stored for the oldest data chain in the buffer.
+ *
+ * Returns the kernel receive timestamp associated with the oldest chain
+ * currently in the buffer. For TCP stream sockets, this is the timestamp
+ * of the last segment in the oldest read call.
+ * If the buffer is empty or no timestamp is available, returns -1.
+ *
+ * Note: Timestamps are stored per internal chain. When evbuffer_pullup()
+ * consolidates multiple chains, only the timestamp from the first (oldest)
+ * chain is preserved. Also, reads may append new data into an existing chain
+ * that does not yet have a timestamp; in that case, draining some (but not all)
+ * bytes from that chain will not change the reported timestamp.
+ *
+ * On TCP stream sockets, kernel receive timestamp delivery (e.g. via
+ * SO_TIMESTAMPNS) is best-effort; evbuffer_get_timestamp() returns -1 if
+ * the kernel did not attach timestamp metadata to the received data.
+ *
+ * @param buffer The buffer to read from
+ * @param timestamp where to store the result
+ * @return 0 success (timestamp was stored)
+ *         -1 failure (buffer empty or no timestamp available)
+ */
+EVENT2_EXPORT_SYMBOL
+int evbuffer_get_timestamp(struct evbuffer *buffer, struct timespec *timestamp);
 
 /**
    Search for a string within an evbuffer.

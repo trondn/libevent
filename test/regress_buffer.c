@@ -453,9 +453,237 @@ test_evbuffer_pullup_with_empty(void *ptr)
 	tt_mem_op(evbuffer_pullup(buf, 3), ==, "foo", 3);
 
  end:
-	if (buf)
+	if (buf) {
 		evbuffer_free(buf);
+	}
 }
+
+static void
+test_evbuffer_get_timestamp(void *ptr)
+{
+	struct evbuffer *buf = NULL;
+	struct timespec ts, ts2;
+	struct timeval tv_sleep = { 0, 10000 }; /* 10 ms */
+	int on = 1;
+	int r;
+	int ts_supported = 1;
+
+	evutil_socket_t fd_pair[2] = { -1, -1 };
+
+	/* 1. Ensure empty buffer returns -1 */
+	buf = evbuffer_new();
+	tt_assert(buf);
+	tt_int_op(evbuffer_get_timestamp(buf, &ts), ==, -1);
+
+	/* Create TCP socketpair */
+	tt_assert(evutil_ersatz_socketpair_(AF_INET, SOCK_STREAM, 0, fd_pair) == 0);
+	evutil_make_socket_nonblocking(fd_pair[0]);
+	evutil_make_socket_nonblocking(fd_pair[1]);
+
+	/* 2. Configure socket option for receive timestamps */
+#ifdef SO_TIMESTAMPNS
+	if (setsockopt(fd_pair[1], SOL_SOCKET, SO_TIMESTAMPNS, (void *)&on, sizeof(on)) == -1) {
+		ts_supported = 0;
+	}
+#elif defined(SO_TIMESTAMP)
+	if (setsockopt(fd_pair[1], SOL_SOCKET, SO_TIMESTAMP, (void *)&on, sizeof(on)) == -1) {
+		ts_supported = 0;
+	}
+#else
+	ts_supported = 0;
+#endif
+
+	/* If timestamps not supported, skip the timestamp checks */
+	if (!ts_supported) {
+		tt_skip();
+		goto end;
+	}
+
+	/* Test EAGAIN handling and ensure no trailing empty chain remains */
+	r = evbuffer_read_with_timestamp_(buf, fd_pair[1], 1024);
+	tt_int_op(r, ==, -1);
+	tt_assert(EVUTIL_ERR_RW_RETRIABLE(evutil_socket_geterror(fd_pair[1])));
+	tt_ptr_op(buf->first, ==, NULL);
+	tt_ptr_op(buf->last, ==, NULL);
+
+	/* 3. Send packet A */
+	r = send(fd_pair[0], "packetA", 7, 0);
+	tt_int_op(r, ==, 7);
+
+	/* Sleep briefly to let the kernel process the packet and stamp it */
+	evutil_usleep_(&tv_sleep);
+
+	/* 4. Read packet A with timestamp */
+	r = evbuffer_read_with_timestamp_(buf, fd_pair[1], 1024);
+	tt_int_op(r, ==, 7);
+
+	/* 5. Fetch and verify timestamp A (if kernel delivered timestamps on loopback TCP) */
+	if (evbuffer_get_timestamp(buf, &ts) != 0) {
+		tt_skip();
+		goto end;
+	}
+	tt_assert(ts.tv_sec > 0);
+	TT_BLATHER(("Captured timestamp A: %lld.%09ld", (long long)ts.tv_sec, (long)ts.tv_nsec));
+
+	/* 6. Send packet B */
+	r = send(fd_pair[0], "packetB", 7, 0);
+	tt_int_op(r, ==, 7);
+
+	evutil_usleep_(&tv_sleep);
+
+	/* 7. Read packet B with timestamp */
+	r = evbuffer_read_with_timestamp_(buf, fd_pair[1], 1024);
+	tt_int_op(r, ==, 7);
+
+	/* 8. Fetch timestamp and verify it still returns packet A's (oldest first) */
+	tt_int_op(evbuffer_get_timestamp(buf, &ts2), ==, 0);
+	tt_int_op(ts.tv_sec, ==, ts2.tv_sec);
+	tt_int_op(ts.tv_nsec, ==, ts2.tv_nsec);
+
+	/* 9. Drain packet A's bytes. Packet A is 7 bytes.
+	 * Draining 3 bytes should still keep packet A's timestamp. */
+	tt_int_op(evbuffer_drain(buf, 3), ==, 0);
+	tt_int_op(evbuffer_get_timestamp(buf, &ts2), ==, 0);
+	tt_int_op(ts.tv_sec, ==, ts2.tv_sec);
+	tt_int_op(ts.tv_nsec, ==, ts2.tv_nsec);
+
+	/* 10. Drain remaining 4 bytes of packet A.
+	 * Each recvmsg() call writes into its own fresh chain, so after fully
+	 * draining packet A the buffer exposes packet B's chain and its
+	 * timestamp. The timestamp must be >= packet A's timestamp. */
+	tt_int_op(evbuffer_drain(buf, 4), ==, 0);
+	tt_int_op(evbuffer_get_timestamp(buf, &ts2), ==, 0);
+	tt_assert(ts2.tv_sec >= ts.tv_sec);
+	if (ts2.tv_sec == ts.tv_sec) {
+		tt_assert(ts2.tv_nsec >= ts.tv_nsec);
+	}
+	TT_BLATHER(("Captured oldest timestamp after draining A: %lld.%09ld",
+	    (long long)ts2.tv_sec, (long)ts2.tv_nsec));
+
+	/* 11. Fully drain the buffer. Assert evbuffer_get_timestamp returns -1. */
+	tt_int_op(evbuffer_drain(buf, 7), ==, 0);
+	tt_int_op(evbuffer_get_timestamp(buf, &ts2), ==, -1);
+
+ end:
+	if (buf) {
+		evbuffer_free(buf);
+	}
+	if (fd_pair[0] != -1) {
+		evutil_closesocket(fd_pair[0]);
+	}
+	if (fd_pair[1] != -1) {
+		evutil_closesocket(fd_pair[1]);
+	}
+}
+
+static void
+test_evbuffer_get_timestamp_unstamped_then_stamped(void *ptr)
+{
+	struct evbuffer *buf = NULL;
+	struct timespec ts, ts2;
+	struct timeval tv_sleep = { 0, 10000 }; /* 10 ms */
+	int on = 1;
+	int r;
+	int ts_supported = 1;
+	struct evbuffer_iovec vec[2];
+	evutil_socket_t fd_pair[2] = { -1, -1 };
+
+	buf = evbuffer_new();
+	tt_assert(buf);
+
+	/* 1. Test evbuffer_commit_space_with_timespec retroactive stamping guard */
+	tt_int_op(evbuffer_reserve_space(buf, 64, vec, 2), >=, 1);
+	vec[0].iov_len = 10;
+	memcpy(vec[0].iov_base, "1234567890", 10);
+	/* Commit without timestamp */
+	tt_int_op(evbuffer_commit_space_with_timespec(buf, vec, 1, NULL), ==, 0);
+	tt_int_op(evbuffer_get_timestamp(buf, &ts), ==, -1);
+
+	/* Reserve space again (will get remaining space in same tail chain) */
+	tt_int_op(evbuffer_reserve_space(buf, 32, vec, 2), >=, 1);
+	vec[0].iov_len = 10;
+	memcpy(vec[0].iov_base, "abcdefghij", 10);
+	ts2.tv_sec = 1234567;
+	ts2.tv_nsec = 890;
+	/* Commit WITH timestamp into chain that already had pre-existing data */
+	tt_int_op(evbuffer_commit_space_with_timespec(buf, vec, 1, &ts2), ==, 0);
+
+	/* Pre-existing data in chain was not retroactively stamped */
+	tt_int_op(evbuffer_get_timestamp(buf, &ts), ==, -1);
+
+	/* Clear buffer */
+	evbuffer_drain(buf, evbuffer_get_length(buf));
+
+	/* 2. Test evbuffer_read_with_timestamp_ when tail chain already has unstamped data */
+	tt_assert(evutil_ersatz_socketpair_(AF_INET, SOCK_STREAM, 0, fd_pair) == 0);
+	evutil_make_socket_nonblocking(fd_pair[0]);
+	evutil_make_socket_nonblocking(fd_pair[1]);
+
+	/* Send packet 1 BEFORE arming timestamps */
+	r = send(fd_pair[0], "unarmed1", 8, 0);
+	tt_int_op(r, ==, 8);
+
+	evutil_usleep_(&tv_sleep);
+
+	/* Read packet 1 (unarmed, so tail chain gets off=8, timestamp.valid=0) */
+	r = evbuffer_read_with_timestamp_(buf, fd_pair[1], 1024);
+	tt_int_op(r, ==, 8);
+	tt_int_op(evbuffer_get_timestamp(buf, &ts), ==, -1);
+
+	/* Now arm timestamps */
+#ifdef SO_TIMESTAMPNS
+	if (setsockopt(fd_pair[1], SOL_SOCKET, SO_TIMESTAMPNS, (void *)&on, sizeof(on)) == -1) {
+		ts_supported = 0;
+	}
+#elif defined(SO_TIMESTAMP)
+	if (setsockopt(fd_pair[1], SOL_SOCKET, SO_TIMESTAMP, (void *)&on, sizeof(on)) == -1) {
+		ts_supported = 0;
+	}
+#else
+	ts_supported = 0;
+#endif
+
+	if (!ts_supported) {
+		tt_skip();
+		goto end;
+	}
+
+	/* Send packet 2 AFTER arming timestamps */
+	r = send(fd_pair[0], "armed2", 6, 0);
+	tt_int_op(r, ==, 6);
+
+	evutil_usleep_(&tv_sleep);
+
+	/* Read packet 2 (armed). Must allocate a fresh chain for packet 2 */
+	r = evbuffer_read_with_timestamp_(buf, fd_pair[1], 1024);
+	tt_int_op(r, ==, 6);
+
+	/* Head of buffer is packet 1 (unstamped), so get_timestamp returns -1 */
+	tt_int_op(evbuffer_get_timestamp(buf, &ts), ==, -1);
+
+	/* Drain packet 1 (8 bytes). Buffer head becomes packet 2's chain */
+	tt_int_op(evbuffer_drain(buf, 8), ==, 0);
+
+	/* Now evbuffer_get_timestamp returns packet 2's valid timestamp (if supported by kernel) */
+	if (evbuffer_get_timestamp(buf, &ts) != 0) {
+		tt_skip();
+		goto end;
+	}
+	tt_assert(ts.tv_sec > 0);
+
+ end:
+	if (buf) {
+		evbuffer_free(buf);
+	}
+	if (fd_pair[0] != -1) {
+		evutil_closesocket(fd_pair[0]);
+	}
+	if (fd_pair[1] != -1) {
+		evutil_closesocket(fd_pair[1]);
+	}
+}
+
+
 
 static void
 test_evbuffer_remove_buffer_with_empty_front(void *ptr)
@@ -2878,6 +3106,8 @@ struct testcase_t evbuffer_testcases[] = {
 	{ "copyout", test_evbuffer_copyout, 0, NULL, NULL},
 	{ "file_segment_add_cleanup_cb", test_evbuffer_file_segment_add_cleanup_cb, 0, NULL, NULL },
 	{ "pullup_with_empty", test_evbuffer_pullup_with_empty, 0, NULL, NULL },
+	{ "get_timestamp", test_evbuffer_get_timestamp, TT_FORK, &basic_setup, NULL },
+	{ "get_timestamp_unstamped_then_stamped", test_evbuffer_get_timestamp_unstamped_then_stamped, TT_FORK, &basic_setup, NULL },
 
 #define ADDFILE_TEST(name, parameters)					\
 	{ name, test_evbuffer_add_file, TT_FORK|TT_NEED_BASE,		\

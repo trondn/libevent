@@ -722,7 +722,15 @@ advance_last_with_data(struct evbuffer *buf)
 
 int
 evbuffer_commit_space(struct evbuffer *buf,
-    struct evbuffer_iovec *vec, int n_vecs)
+	struct evbuffer_iovec *vec, int n_vecs)
+{
+	return evbuffer_commit_space_with_timespec(buf, vec, n_vecs, NULL);
+}
+
+int
+evbuffer_commit_space_with_timespec(struct evbuffer *buf,
+	struct evbuffer_iovec *vec, int n_vecs,
+	const struct timespec *ts)
 {
 	struct evbuffer_chain *chain, **firstchainp, **chainp;
 	int result = -1;
@@ -744,6 +752,19 @@ evbuffer_commit_space(struct evbuffer *buf,
 			goto done;
 		buf->last->off += vec[0].iov_len;
 		added = vec[0].iov_len;
+		if (ts && added) {
+			if (buf->last->timestamp.valid == 0 && buf->last->off == added) {
+				buf->last->timestamp.ts = *ts;
+				buf->last->timestamp.valid = 1;
+			} else if (buf->last->off != added) {
+				/* This chain already held data from an earlier
+				 * commit; it can no longer represent a single
+				 * timestamp for all of its bytes. Invalidate
+				 * rather than let the earlier timestamp be
+				 * silently misattributed to this newer data. */
+				buf->last->timestamp.valid = 0;
+			}
+		}
 		if (added)
 			advance_last_with_data(buf);
 		goto okay;
@@ -773,6 +794,15 @@ evbuffer_commit_space(struct evbuffer *buf,
 	for (i=0; i<n_vecs; ++i) {
 		(*chainp)->off += vec[i].iov_len;
 		added += vec[i].iov_len;
+		if (ts && vec[i].iov_len) {
+			if ((*chainp)->timestamp.valid == 0 && (*chainp)->off == vec[i].iov_len) {
+				(*chainp)->timestamp.ts = *ts;
+				(*chainp)->timestamp.valid = 1;
+			} else if ((*chainp)->off != vec[i].iov_len) {
+				/* See the n_vecs==1 case above. */
+				(*chainp)->timestamp.valid = 0;
+			}
+		}
 		if (vec[i].iov_len) {
 			buf->last_with_datap = chainp;
 		}
@@ -842,10 +872,12 @@ PRESERVE_PINNED(struct evbuffer *src, struct evbuffer_chain **first,
 		memcpy(tmp->buffer, chain->buffer + chain->misalign,
 			chain->off);
 		tmp->off = chain->off;
+		tmp->timestamp = chain->timestamp;
 		*src->last_with_datap = tmp;
 		src->last = tmp;
 		chain->misalign += chain->off;
 		chain->off = 0;
+		chain->timestamp.valid = 0;
 	} else {
 		src->last = *src->last_with_datap;
 		*pinned = NULL;
@@ -940,6 +972,7 @@ APPEND_CHAIN_MULTICAST(struct evbuffer *dst, struct evbuffer *src)
 		tmp->off = chain->off;
 		tmp->flags |= EVBUFFER_MULTICAST|EVBUFFER_IMMUTABLE;
 		tmp->buffer = chain->buffer;
+		tmp->timestamp = chain->timestamp;
 		evbuffer_chain_insert(dst, tmp);
 	}
 }
@@ -1150,6 +1183,7 @@ evbuffer_drain(struct evbuffer *buf, size_t len)
 				EVUTIL_ASSERT(remaining == 0);
 				chain->misalign += chain->off;
 				chain->off = 0;
+				chain->timestamp.valid = 0;
 				break;
 			} else
 				evbuffer_chain_free(chain);
@@ -1391,6 +1425,11 @@ evbuffer_pullup(struct evbuffer *buf, ev_ssize_t size)
 	}
 
 	if (CHAIN_PINNED(chain)) {
+		/* Pinned chain case: expand in-place by appending data from
+		 * subsequent chains. Timestamps from subsequent chains being
+		 * consolidated are intentionally discarded; only this chain's
+		 * timestamp is preserved as it contains the oldest data.
+		 */
 		size_t old_off = chain->off;
 		if (CHAIN_SPACE_LEN(chain) < size - chain->off) {
 			/* not enough room at end of chunk. */
@@ -1402,6 +1441,11 @@ evbuffer_pullup(struct evbuffer *buf, ev_ssize_t size)
 		size -= old_off;
 		chain = chain->next;
 	} else if (chain->buffer_len - chain->misalign >= (size_t)size) {
+		/* Sufficient space case: expand in-place without reallocation
+		 * by appending data from subsequent chains. Timestamps from
+		 * subsequent chains being consolidated are intentionally discarded;
+		 * only this chain's timestamp is preserved.
+		 */
 		/* already have enough space in the first chain */
 		size_t old_off = chain->off;
 		buffer = chain->buffer + chain->misalign + chain->off;
@@ -1416,12 +1460,20 @@ evbuffer_pullup(struct evbuffer *buf, ev_ssize_t size)
 		}
 		buffer = tmp->buffer;
 		tmp->off = size;
+		/* tmp is freshly zeroed by evbuffer_chain_new(), so this
+		 * copy is equivalent whether or not chain->timestamp.valid
+		 * is set -- no need to guard it. */
+		tmp->timestamp = chain->timestamp;
 		buf->first = tmp;
 	}
 
 	/* TODO(niels): deal with buffers that point to NULL like sendfile */
 
-	/* Copy and free every chunk that will be entirely pulled into tmp */
+	/* Copy and free every chunk that will be entirely pulled into tmp.
+	 * Timestamps of the consumed chains are intentionally discarded: tmp
+	 * keeps only the timestamp of the chain holding the oldest data (set
+	 * above), so that a chain with no timestamp of its own is never
+	 * mis-attributed a later chain's timestamp. */
 	last_with_data = *buf->last_with_datap;
 	for (; chain != NULL && (size_t)size >= chain->off; chain = next) {
 		next = chain->next;
@@ -1440,6 +1492,8 @@ evbuffer_pullup(struct evbuffer *buf, ev_ssize_t size)
 	}
 
 	if (chain != NULL) {
+		/* chain's own timestamp (if any) belongs to the data left behind
+		 * in chain, not to tmp; see the discard rationale above. */
 		memcpy(buffer, chain->buffer + chain->misalign, size);
 		chain->misalign += size;
 		chain->off -= size;
@@ -2027,6 +2081,7 @@ evbuffer_expand_singlechain(struct evbuffer *buf, size_t datlen)
 		tmp->off = chain->off;
 		memcpy(tmp->buffer, chain->buffer + chain->misalign,
 		    chain->off);
+		tmp->timestamp = chain->timestamp;
 		/* fix up the list */
 		EVUTIL_ASSERT(*chainp == chain);
 		result = *chainp = tmp;
@@ -2283,14 +2338,39 @@ get_n_bytes_readable_on_socket(evutil_socket_t fd)
 #endif
 }
 
-/* TODO(niels): should this function return ev_ssize_t and take ev_ssize_t
- * as howmuch? */
-int
-evbuffer_read(struct evbuffer *buf, evutil_socket_t fd, int howmuch)
+/**
+ * Reads data from a socket optionally with kernel timestamp support.
+ *
+ * @param buf the evbuffer to populate
+ * @param fd the file descriptor to use
+ * @param howmuch the amount of data to read (this will be adjusted;
+ *                see below)
+ * @param use_recvmsg try to use recvmsg to read the data (and try to
+ *                    read kernel timestamps)
+ *
+ * We'll try to read howmuch bytes, unless howmuch is negative or greater
+ * than EVBUFFER_MAX_READ, in which case we try to read EVBUFFER_MAX_READ
+ * bytes instead. Either way, if the socket has fewer bytes available right
+ * now (via FIONREAD), we only try to read that many: no single call ever
+ * reads more than EVBUFFER_MAX_READ bytes, regardless of howmuch.
+ *
+ * If use_recvmsg is nonzero, it attempts to retrieve the SO_TIMESTAMPNS or
+ * SO_TIMESTAMP ancillary data from recvmsg() and associate it with the buffer
+ * data. Each recvmsg() call writes into a newly allocated chain, so every
+ * call gets its own chain and its timestamp is preserved independently.
+ *
+ * TODO(niels): should this function return ev_ssize_t and take ev_ssize_t
+ * as howmuch?
+ */
+static int
+evbuffer_read_impl_(struct evbuffer *buf, evutil_socket_t fd, int howmuch, int use_recvmsg)
 {
 	struct evbuffer_chain **chainp;
 	int n;
 	int result;
+#ifndef _WIN32
+	struct evbuffer_chain *new_chain = NULL;
+#endif
 
 #ifdef USE_IOVEC_IMPL
 	int nvecs, i, remaining;
@@ -2298,6 +2378,9 @@ evbuffer_read(struct evbuffer *buf, evutil_socket_t fd, int howmuch)
 	struct evbuffer_chain *chain;
 	unsigned char *p;
 #endif
+	struct timespec ts;
+	int ts_found = 0;
+	memset(&ts, 0, sizeof(ts));
 
 	EVBUFFER_LOCK(buf);
 
@@ -2313,26 +2396,49 @@ evbuffer_read(struct evbuffer *buf, evutil_socket_t fd, int howmuch)
 		howmuch = n;
 
 #ifdef USE_IOVEC_IMPL
-	/* Since we can use iovecs, we're willing to use the last
-	 * NUM_READ_IOVEC chains. */
-	if (evbuffer_expand_fast_(buf, howmuch, NUM_READ_IOVEC) == -1) {
-		result = -1;
-		goto done;
-	} else {
+	{
 		IOV_TYPE vecs[NUM_READ_IOVEC];
-#ifdef EVBUFFER_IOVEC_IS_NATIVE_
-		nvecs = evbuffer_read_setup_vecs_(buf, howmuch, vecs,
-		    NUM_READ_IOVEC, &chainp, 1);
-#else
-		/* We aren't using the native struct iovec.  Therefore,
-		   we are on win32. */
-		struct evbuffer_iovec ev_vecs[NUM_READ_IOVEC];
-		nvecs = evbuffer_read_setup_vecs_(buf, howmuch, ev_vecs, 2,
-		    &chainp, 1);
-
-		for (i=0; i < nvecs; ++i)
-			WSABUF_FROM_EVBUFFER_IOV(&vecs[i], &ev_vecs[i]);
+#ifndef _WIN32
+		if (use_recvmsg) {
+			/* Allocate a fresh chain for each recvmsg() call so that
+			 * every timestamped call gets its own chain with an independent timestamp. */
+			struct evbuffer_chain **tp;
+			new_chain = evbuffer_chain_new(howmuch);
+			if (!new_chain) {
+				result = -1;
+				goto done;
+			}
+			evbuffer_chain_insert(buf, new_chain);
+			tp = buf->last_with_datap;
+			while (*tp && *tp != new_chain) {
+				tp = &(*tp)->next;
+			}
+			chainp = tp;
+			nvecs = 1;
+			vecs[0].iov_base = (void *)CHAIN_SPACE_PTR(new_chain);
+			vecs[0].iov_len = (size_t)howmuch;
+		} else
 #endif
+		/* Since we can use iovecs, we're willing to use the last
+		 * NUM_READ_IOVEC chains. */
+		if (evbuffer_expand_fast_(buf, howmuch, NUM_READ_IOVEC) == -1) {
+			result = -1;
+			goto done;
+		} else {
+#ifdef EVBUFFER_IOVEC_IS_NATIVE_
+			nvecs = evbuffer_read_setup_vecs_(buf, howmuch, vecs,
+			    NUM_READ_IOVEC, &chainp, 1);
+#else
+			/* We aren't using the native struct iovec.  Therefore,
+			   we are on win32. */
+			struct evbuffer_iovec ev_vecs[NUM_READ_IOVEC];
+			nvecs = evbuffer_read_setup_vecs_(buf, howmuch, ev_vecs, 2,
+			    &chainp, 1);
+
+			for (i=0; i < nvecs; ++i)
+				WSABUF_FROM_EVBUFFER_IOV(&vecs[i], &ev_vecs[i]);
+#endif
+		}
 
 #ifdef _WIN32
 		{
@@ -2349,7 +2455,77 @@ evbuffer_read(struct evbuffer *buf, evutil_socket_t fd, int howmuch)
 				n = bytesRead;
 		}
 #else
-		n = readv(fd, vecs, nvecs);
+		if (use_recvmsg) {
+			struct msghdr msg;
+			/* Control message buffer for cmsg data.
+			 * Sized to accommodate timestamp messages (SCM_TIMESTAMPNS,
+			 * SCM_TIMESTAMP). */
+#define EVBUFFER_RECVMSG_CTRLFN_SZ \
+			(CMSG_SPACE(sizeof(struct timespec)) + \
+			 CMSG_SPACE(sizeof(struct timeval)))
+			union {
+				unsigned char buf[EVBUFFER_RECVMSG_CTRLFN_SZ];
+				struct cmsghdr align;
+			} control;
+#undef EVBUFFER_RECVMSG_CTRLFN_SZ
+
+			/* Setup message header */
+			memset(&msg, 0, sizeof(msg));
+			msg.msg_iov = vecs;
+			msg.msg_iovlen = nvecs;
+			msg.msg_control = control.buf;
+			msg.msg_controllen = sizeof(control);
+
+			/* Receive with ancillary data */
+			n = recvmsg(fd, &msg, 0);
+
+			if (n > 0) {
+				struct cmsghdr *cmsg;
+				for (cmsg = CMSG_FIRSTHDR(&msg); cmsg; cmsg = CMSG_NXTHDR(&msg, cmsg)) {
+					if (cmsg->cmsg_level != SOL_SOCKET) {
+						continue;
+					}
+					/* MSG_CTRUNC only means the tail of the control
+					 * buffer was dropped; a cmsg we actually got
+					 * here is intact regardless of that flag, and
+					 * the cmsg_len checks below are what protect
+					 * against reading a cmsg that was itself cut
+					 * short. */
+#if EVENT__HAVE_DECL_SO_TIMESTAMPNS
+					if (cmsg->cmsg_type == SCM_TIMESTAMPNS) {
+						if (cmsg->cmsg_len < CMSG_LEN(sizeof(struct timespec))) {
+							continue;
+						}
+						ts = *(struct timespec *)(void *)CMSG_DATA(cmsg);
+						ts_found = 1;
+						continue;
+					}
+#endif
+
+#if EVENT__HAVE_DECL_SO_TIMESTAMP
+					if (cmsg->cmsg_type == SCM_TIMESTAMP) {
+						struct timeval *tv;
+						if (ts_found) {
+							/* A nanosecond-precision SCM_TIMESTAMPNS
+							 * already won; don't let a coarser
+							 * SCM_TIMESTAMP overwrite it. */
+							continue;
+						}
+						if (cmsg->cmsg_len < CMSG_LEN(sizeof(struct timeval))) {
+							continue;
+						}
+						tv = (struct timeval *)(void *)CMSG_DATA(cmsg);
+						ts.tv_sec = tv->tv_sec;
+						ts.tv_nsec = tv->tv_usec * 1000L;
+						ts_found = 1;
+						continue;
+					}
+#endif
+				}
+			}
+		} else {
+			n = readv(fd, vecs, nvecs);
+		}
 #endif
 	}
 
@@ -2372,12 +2548,16 @@ evbuffer_read(struct evbuffer *buf, evutil_socket_t fd, int howmuch)
 #endif
 #endif /* USE_IOVEC_IMPL */
 
-	if (n == -1) {
-		result = -1;
-		goto done;
-	}
-	if (n == 0) {
-		result = 0;
+	if (n <= 0) {
+		result = n;
+#ifndef _WIN32
+		if (new_chain) {
+			int saved_errno = EVUTIL_SOCKET_ERROR();
+			evbuffer_free_trailing_empty_chains(buf);
+			buf->last = *buf->last_with_datap;
+			EVUTIL_SET_SOCKET_ERROR(saved_errno);
+		}
+#endif
 		goto done;
 	}
 
@@ -2394,8 +2574,16 @@ evbuffer_read(struct evbuffer *buf, evutil_socket_t fd, int howmuch)
 		if ((ev_ssize_t)space < remaining) {
 			(*chainp)->off += space;
 			remaining -= (int)space;
+			if (ts_found && (*chainp)->timestamp.valid == 0) {
+				(*chainp)->timestamp.ts = ts;
+				(*chainp)->timestamp.valid = 1;
+			}
 		} else {
 			(*chainp)->off += remaining;
+			if (ts_found && (*chainp)->timestamp.valid == 0) {
+				(*chainp)->timestamp.ts = ts;
+				(*chainp)->timestamp.valid = 1;
+			}
 			buf->last_with_datap = chainp;
 			break;
 		}
@@ -2414,6 +2602,53 @@ evbuffer_read(struct evbuffer *buf, evutil_socket_t fd, int howmuch)
 done:
 	EVBUFFER_UNLOCK(buf);
 	return result;
+}
+
+int
+evbuffer_read(struct evbuffer *buf, evutil_socket_t fd, int howmuch)
+{
+	return evbuffer_read_impl_(buf, fd, howmuch, 0);
+}
+
+int
+evbuffer_read_with_timestamp_(
+	struct evbuffer *buf, evutil_socket_t fd, int howmuch)
+{
+	return evbuffer_read_impl_(buf, fd, howmuch, 1);
+}
+
+int evbuffer_get_timestamp(
+	struct evbuffer *buf, struct timespec *timestamp)
+{
+	int result = -1;
+	if (!timestamp) {
+		return -1;
+	}
+	EVBUFFER_LOCK(buf);
+	{
+		if (buf->first && buf->first->timestamp.valid) {
+			*timestamp = buf->first->timestamp.ts;
+			result = 0;
+		}
+	}
+	EVBUFFER_UNLOCK(buf);
+	return result;
+}
+
+/* Invalidate the timestamp (if any) on buf's current tail chain. Used when
+ * switching a bufferevent to a different fd: the tail chain may still have
+ * spare capacity and undrained data timestamped from the old fd, and a
+ * later plain (non-timestamped) read on the new fd could otherwise extend
+ * that same chain, making evbuffer_get_timestamp() misattribute the old
+ * fd's timestamp to the new fd's data. */
+void
+evbuffer_invalidate_last_chain_timestamp_(struct evbuffer *buf)
+{
+	EVBUFFER_LOCK(buf);
+	if (buf->last) {
+		buf->last->timestamp.valid = 0;
+	}
+	EVBUFFER_UNLOCK(buf);
 }
 
 #ifdef USE_IOVEC_IMPL

@@ -170,7 +170,31 @@ enum bufferevent_options {
 	* bufferevent.  This option currently requires that
 	* BEV_OPT_DEFER_CALLBACKS also be set; a future version of Libevent
 	* might remove the requirement.*/
-	BEV_OPT_UNLOCK_CALLBACKS = (1<<3)
+	BEV_OPT_UNLOCK_CALLBACKS = (1<<3),
+
+	/** If set, capture kernel-measured receive timestamps for
+	 * stream (SOCK_STREAM / TCP) socket bufferevents. Timestamps
+	 * can be retrieved from the input buffer using
+	 * evbuffer_get_timestamp(). Supported for stream socket
+	 * bufferevents created with bufferevent_socket_new() and
+	 * OpenSSL socket bufferevents created with
+	 * bufferevent_openssl_socket_new().
+	 *
+	 * Datagram sockets (SOCK_DGRAM / UDP) are not supported.
+	 *
+	 * This option can silently fail to take effect: unsupported on
+	 * non-stream (SOCK_DGRAM) sockets, AF_UNIX/AF_LOCAL sockets,
+	 * and on SOCK_STREAM sockets on BSD-derived kernels (macOS,
+	 * FreeBSD, OpenBSD, NetBSD, DragonFly) that lack
+	 * SO_TIMESTAMPNS, where SO_TIMESTAMP is a silent no-op for
+	 * stream sockets. For OpenSSL bufferevents, it additionally
+	 * requires the SSL to use a single BIO for both reading and
+	 * writing. Use bufferevent_get_recv_timestamps_enabled() once the
+	 * fd is set (immediately, if a real fd was passed to
+	 * bufferevent_socket_new(); otherwise after
+	 * bufferevent_socket_connect() or bufferevent_setfd()) to check
+	 * whether it actually took effect. */
+	BEV_OPT_RECV_TIMESTAMPS = (1<<4)
 };
 
 /**
@@ -481,6 +505,28 @@ int bufferevent_disable(struct bufferevent *bufev, short event);
  */
 EVENT2_EXPORT_SYMBOL
 short bufferevent_get_enabled(struct bufferevent *bufev);
+
+/**
+   Check whether kernel receive timestamps ended up enabled on a
+   bufferevent created with BEV_OPT_RECV_TIMESTAMPS.
+
+   The option can silently fail to take effect -- e.g. on non-stream
+   (SOCK_DGRAM) sockets, on AF_UNIX/AF_LOCAL sockets, on SOCK_STREAM sockets
+   on BSD-derived kernels without SO_TIMESTAMPNS, or for an OpenSSL
+   bufferevent whose rbio/wbio are not a single plain socket BIO -- in
+   which case the bufferevent is created successfully but
+   evbuffer_get_timestamp() will never return a timestamp. Call this once
+   the bufferevent's fd is set to detect that case: immediately, if a real
+   fd was passed to bufferevent_socket_new()/bufferevent_openssl_socket_new();
+   otherwise after bufferevent_socket_connect() or bufferevent_setfd().
+   Before the fd is set, this always returns 0.
+
+   @param bev the bufferevent to inspect
+   @return 1 if receive timestamps are armed on this bufferevent's
+     socket, 0 otherwise
+ */
+EVENT2_EXPORT_SYMBOL
+int bufferevent_get_recv_timestamps_enabled(struct bufferevent *bev);
 
 /**
   Set the read and write timeout for a bufferevent.
